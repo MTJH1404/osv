@@ -31,6 +31,8 @@
 #include <cmath>
 #include <set>
 
+TRACEPOINT(trace_allocate, "start=%d, len=%d", uintptr_t, size_t);
+
 // FIXME: Without this pragma, we get a lot of warnings that I don't know
 // how to explain or fix. For now, let's just ignore them :-(
 #pragma GCC diagnostic ignored "-Wstringop-overflow"
@@ -50,9 +52,9 @@ namespace mmu {
 
 #if CONF_lazy_stack
 // We need to ensure that lazy stack is populated deeply enough (2 pages)
-// for all the cases when the vma_list_mutex is taken for write to prevent
+// for all the cases when the vma_buddy_list_mutex is taken for write to prevent
 // page faults triggered on stack. The page-fault handling logic would
-// attempt to take same vma_list_mutex fo read and end up with a deadlock.
+// attempt to take same vma_buddy_list_mutex fo read and end up with a deadlock.
 #define PREVENT_STACK_PAGE_FAULT \
     arch::ensure_next_two_stack_pages();
 #else
@@ -89,6 +91,7 @@ constexpr uintptr_t upper_vma_limit = 0x400000000000;
 
 const auto max_powers = static_cast<uint>(std::ceil(std::log(static_cast<float>(upper_vma_limit)) / std::log(static_cast<float>(2))));
 
+//Buddy implementation TODO 
 __attribute__((init_priority((int)init_prio::vma_free_list)))
 std::vector<std::vector<addr_range>> vma_free_list;
 rwlock_t vma_free_list_mutex;
@@ -99,34 +102,26 @@ typedef boost::intrusive::set<vma,
                                               bi::set_member_hook<>,
                                               &vma::_vma_list_hook>,
                               bi::optimize_size<true>
-                              > vma_list_base;
+                              > vma_buddy_list_base;
 
-struct vma_list_type : vma_list_base {
-    vma_list_type() {
-        // insert markers for the edges of allocatable area
-        // simplifies searches
-        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
-        insert(*lower_edge);
-        auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
-        insert(*upper_edge);
-
+struct vma_buddy_list_type : vma_buddy_list_base {
+    vma_buddy_list_type() {
         for (uint i=0; i<max_powers; i++) vma_free_list.push_back(std::vector<addr_range>());
         WITH_LOCK(vma_free_list_mutex.for_write()) {
             vma_free_list[max_powers].push_back(addr_range(lower_vma_limit, upper_vma_limit));
         }
     }
 };
-
-__attribute__((init_priority((int)init_prio::vma_list)))
-vma_list_type vma_list;
+__attribute__((init_priority((int)init_prio::vma_buddy_list)))
+vma_buddy_list_type vma_buddy_list;
 
 // protects vma list and page table modifications.
 // anything that may add, remove, split vma, zaps pte or changes pte permission
 // should hold the lock for write
-rwlock_t vma_list_mutex;
+rwlock_t vma_buddy_list_mutex;
 
 // A mutex serializing modifications to the high part of the page table
-// (linear map, etc.) which are not part of vma_list.
+// (linear map, etc.) which are not part of vma_buddy_list.
 mutex page_table_high_mutex;
 
 // 1's for the bits provided by the pte for this level
@@ -289,8 +284,8 @@ struct page_allocator {
 
 unsigned long all_vmas_size()
 {
-    SCOPE_LOCK(vma_list_mutex.for_read());
-    return std::accumulate(vma_list.begin(), vma_list.end(), size_t(0), [](size_t s, vma& v) { return s + v.size(); });
+    SCOPE_LOCK(vma_buddy_list_mutex.for_read());
+    return std::accumulate(vma_buddy_list.begin(), vma_buddy_list.end(), size_t(0), [](size_t s, vma& v) { return s + v.size(); });
 }
 
 void clamp(uintptr_t& vstart1, uintptr_t& vend1,
@@ -696,7 +691,7 @@ public:
         void* addr = phys_to_virt(ptep.read().addr());
         size_t size = pt_level_traits<N>::size::value;
         // Note: we free the page even if it is already marked "not present".
-        // evacuate() makes sure we are only called for allocated pages, and
+        // deallocate() makes sure we are only called for allocated pages, and
         // not-present may only mean mprotect(PROT_NONE).
         if (_pops->unmap(addr, offset, ptep)) {
             do_flush = !_tlb_gather.push(addr, size);
@@ -935,10 +930,10 @@ public:
 };
 
 // Find the single (if any) vma which contains the given address.
-// The complexity is logarithmic in the number of vmas in vma_list.
-static inline vma_list_type::iterator
-find_intersecting_vma(uintptr_t addr) {
-    auto vma = vma_list.lower_bound(addr, addr_compare());
+// The complexity is logarithmic in the number of vmas in vma_buddy_list.
+static inline vma_buddy_list_type::iterator
+find_intersecting_vma_buddy(uintptr_t addr) {
+    auto vma = vma_buddy_list.lower_bound(addr, addr_compare());
     if (vma->start() == addr) {
         return vma;
     }
@@ -947,22 +942,22 @@ find_intersecting_vma(uintptr_t addr) {
     if (addr >= vma->start() && addr < vma->end()) {
         return vma;
     } else {
-        return vma_list.end();
+        return vma_buddy_list.end();
     }
 }
 
 // Find the list of vmas which intersect a given address range. Because the
-// vmas are sorted in vma_list, the result is a consecutive slice of vma_list,
+// vmas are sorted in vma_buddy_list, the result is a consecutive slice of vma_buddy_list,
 // [first, second), between the first returned iterator (inclusive), and the
 // second returned iterator (not inclusive).
-// The complexity is logarithmic in the number of vmas in vma_list.
-static inline std::pair<vma_list_type::iterator, vma_list_type::iterator>
-find_intersecting_vmas(const addr_range& r)
+// The complexity is logarithmic in the number of vmas in vma_buddy_list.
+static inline std::pair<vma_buddy_list_type::iterator, vma_buddy_list_type::iterator>
+find_intersecting_vmas_buddy(const addr_range& r)
 {
     if (r.end() <= r.start()) { // empty range, so nothing matches
-        return {vma_list.end(), vma_list.end()};
+        return {vma_buddy_list.end(), vma_buddy_list.end()};
     }
-    auto start = vma_list.lower_bound(r.start(), addr_compare());
+    auto start = vma_buddy_list.lower_bound(r.start(), addr_compare());
     if (start->start() > r.start()) {
         // The previous vma might also intersect with our range if it ends
         // after our range's start.
@@ -974,14 +969,13 @@ find_intersecting_vmas(const addr_range& r)
     // If the start vma is actually beyond the end of the search range,
     // there is no intersection.
     if (start->start() >= r.end()) {
-        return {vma_list.end(), vma_list.end()};
+        return {vma_buddy_list.end(), vma_buddy_list.end()};
     }
     // end is the first vma starting >= r.end(), so any previous vma (after
     // start) surely started < r.end() so is part of the intersection.
-    auto end = vma_list.lower_bound(r.end(), addr_compare());
+    auto end = vma_buddy_list.lower_bound(r.end(), addr_compare());
     return {start, end};
 }
-
 
 /**
  * Change virtual memory range protection
@@ -995,7 +989,7 @@ static error protect(const void *addr, size_t size, unsigned int perm)
 {
     uintptr_t start = reinterpret_cast<uintptr_t>(addr);
     uintptr_t end = start + size;
-    auto range = find_intersecting_vmas(addr_range(start, end));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, end));
     for (auto i = range.first; i != range.second; ++i) {
         if (i->perm() == perm)
             continue;
@@ -1123,7 +1117,7 @@ void add_free(addr_range range) {
 }
 
 // Only deallocate existings vmas here //TODO
-ulong deallocate(vma_list_type::iterator vma) 
+ulong deallocate(vma_buddy_list_type::iterator vma) 
 {
     // If no such starting address available
     auto& dead = *vma;
@@ -1131,7 +1125,7 @@ ulong deallocate(vma_list_type::iterator vma)
     if (dead.has_flags(mmap_jvm_heap)) {
         memory::stats::on_jvm_heap_free(size);
     }
-    vma_list.erase(dead);
+    vma_buddy_list.erase(dead);
  
     // Add the block in free list
     add_free(addr_range(dead.start(), dead.end()));
@@ -1143,10 +1137,10 @@ ulong deallocate(vma_list_type::iterator vma)
 
 ulong evacuate(uintptr_t start, uintptr_t end)
 {
-    auto range = find_intersecting_vmas(addr_range(start, end));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, end));
     ulong ret = 0;
     for (auto i = range.first; i != range.second; ++i) {
-        ret += deallocate(i);
+        ret += deallocate(i--);
     }
     return ret;
 }
@@ -1164,7 +1158,7 @@ static error sync(const void* addr, size_t length, int flags)
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto end = start+length;
     auto err = make_error(ENOMEM);
-    auto range = find_intersecting_vmas(addr_range(start, end));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, end));
     for (auto i = range.first; i != range.second; ++i) {
         err = i->sync(std::max(start, i->start()), std::min(end, i->end()));
         if (err.bad()) {
@@ -1270,8 +1264,11 @@ public:
     }
 };
 
-uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
-{
+
+
+uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search) 
+{ //TODO
+    trace_allocate(start, size);
     if (!search) {
         evacuate(start, start + size);
     } 
@@ -1282,7 +1279,7 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     start = free.start();
     size = free.end()-free.start();
     v->set(start, start+size);
-    vma_list.insert(*v);
+    vma_buddy_list.insert(*v);
     return start;
 }
 
@@ -1322,7 +1319,7 @@ static void depopulate(void* addr, size_t length)
 {
     length = align_up(length, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
-    auto range = find_intersecting_vmas(addr_range(start, start + length));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, start + length));
     for (auto i = range.first; i != range.second; ++i) {
         i->operate_range(unpopulate<>(i->page_ops()), reinterpret_cast<void*>(start), std::min(length, i->size()));
         start += i->size();
@@ -1334,7 +1331,7 @@ static void nohugepage(void* addr, size_t length)
 {
     length = align_up(length, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
-    auto range = find_intersecting_vmas(addr_range(start, start + length));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, start + length));
     for (auto i = range.first; i != range.second; ++i) {
         if (!i->has_flags(mmap_small)) {
             i->update_flags(mmap_small);
@@ -1348,7 +1345,7 @@ static void nohugepage(void* addr, size_t length)
 error advise(void* addr, size_t size, int advice)
 {
     PREVENT_STACK_PAGE_FAULT
-    WITH_LOCK(vma_list_mutex.for_write()) {
+    WITH_LOCK(vma_buddy_list_mutex.for_write()) {
         if (!ismapped(addr, size)) {
             return make_error(ENOMEM);
         }
@@ -1388,7 +1385,7 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
     PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
+    SCOPE_LOCK(vma_buddy_list_mutex.for_write());
     auto v = (void*) allocate(vma, start, size, search);
     if (flags & mmap_populate) {
         populate_vma(vma, v, size);
@@ -1415,7 +1412,7 @@ void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
     auto *vma = f->mmap(addr_range(start, start + size), flags | mmap_file, perm, offset).release();
     void *v;
     PREVENT_STACK_PAGE_FAULT
-    WITH_LOCK(vma_list_mutex.for_write()) {
+    WITH_LOCK(vma_buddy_list_mutex.for_write()) {
         v = (void*) allocate(vma, start, size, search);
         if (flags & mmap_populate) {
             populate_vma(vma, v, std::min(size, align_up(::size(f), page_size)));
@@ -1432,13 +1429,13 @@ bool is_linear_mapped(const void *addr, size_t size)
     return addr >= phys_mem;
 }
 
-// Checks if the entire given memory region is mmap()ed (in vma_list).
+// Checks if the entire given memory region is mmap()ed (in vma_buddy_list).
 bool ismapped(const void *addr, size_t size)
 {
     uintptr_t start = (uintptr_t) addr;
     uintptr_t end = start + size;
 
-    auto range = find_intersecting_vmas(addr_range(start, end));
+    auto range = find_intersecting_vmas_buddy(addr_range(start, end));
     for (auto p = range.first; p != range.second; ++p) {
         if (p->start() > start)
             return false;
@@ -1515,9 +1512,9 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     }
 #endif
     addr = align_down(addr, mmu::page_size);
-    WITH_LOCK(vma_list_mutex.for_read()) {
-        auto vma = find_intersecting_vma(addr);
-        if (vma == vma_list.end() || access_fault(*vma, ef->get_error())) {
+    WITH_LOCK(vma_buddy_list_mutex.for_read()) {
+        auto vma = find_intersecting_vma_buddy(addr);
+        if (vma == vma_buddy_list.end() || access_fault(*vma, ef->get_error())) {
             vm_sigsegv(addr, ef);
             trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "slow");
             return;
@@ -1582,7 +1579,7 @@ unsigned vma::flags() const
 
 void vma::update_flags(unsigned flag)
 {
-    assert(vma_list_mutex.wowned());
+    assert(vma_buddy_list_mutex.wowned());
     _flags |= flag;
 }
 
@@ -1639,6 +1636,12 @@ static page_allocator *page_allocator_noinitp = &page_allocator_noinit, *page_al
 anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
     : vma(range, perm, flags, true, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp)
 {
+}
+
+// Not used in buddy implmenetation
+void anon_vma::split(uintptr_t edge)
+{
+    return;
 }
 
 error anon_vma::sync(uintptr_t start, uintptr_t end)
@@ -1713,10 +1716,10 @@ bool jvm_balloon_vma::add_partial(size_t partial, unsigned char *eff)
     return _partial_copy == real_size();
 }
 
-/*void jvm_balloon_vma::split(uintptr_t edge)
+void jvm_balloon_vma::split(uintptr_t edge)
 {
     abort();
-}*/
+}
 
 error jvm_balloon_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -1745,7 +1748,7 @@ jvm_balloon_vma::~jvm_balloon_vma()
     // it believes the objects are no longer valid. It could be the case
     // for a dangling mapping representing a balloon that was already moved
     // out.
-    vma_list.erase(*this);
+    vma_buddy_list.erase(*this);
     add_free(addr_range(this->start(), this->end()));
 
     assert(!(_real_flags & mmap_jvm_balloon));
@@ -1766,12 +1769,12 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
     auto start = reinterpret_cast<uintptr_t>(addr);
 
     vma* v;
-    WITH_LOCK(vma_list_mutex.for_read()) {
+    WITH_LOCK(vma_buddy_list_mutex.for_read()) {
         u64 a = reinterpret_cast<u64>(addr);
-        v = &*find_intersecting_vma(a);
+        v = &*find_intersecting_vma_buddy(a);
 
         // It has to be somewhere!
-        assert(v != &*vma_list.end());
+        assert(v != &*vma_buddy_list.end());
         assert(v->has_flags(mmap_jvm_heap) | v->has_flags(mmap_jvm_balloon));
         if (v->has_flags(mmap_jvm_balloon) && (v->addr() == addr)) {
             jvm_balloon_vma *j = static_cast<jvm_balloon_vma *>(&*v);
@@ -1785,14 +1788,14 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
     auto* vma = new mmu::jvm_balloon_vma(jvm_addr, start, start + size, b, v->perm(), v->flags());
 
     PREVENT_STACK_PAGE_FAULT
-    WITH_LOCK(vma_list_mutex.for_write()) {
+    WITH_LOCK(vma_buddy_list_mutex.for_write()) {
         // This means that the mapping that we had before was a balloon mapping
         // that was laying around and wasn't updated to an anon mapping. If we
         // allow it to split it would significantly complicate our code, since
         // now the finishing code would have to deal with the case where the
         // bounds found in the vma are not the real bounds. We delete it right
         // away and avoid it altogether.
-        auto range = find_intersecting_vmas(addr_range(start, start + size));
+        auto range = find_intersecting_vmas_buddy(addr_range(start, start + size));
 
         for (auto i = range.first; i != range.second; ++i) {
             if (i->has_flags(mmap_jvm_balloon)) {
@@ -1815,7 +1818,7 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
                     assert(jvma->start() != start);
                     // Since we will change its position in the tree, for the sake of future
                     // lookups we need to reinsert it.
-                    vma_list.erase(*jvma);
+                    vma_buddy_list.erase(*jvma);
                     add_free(addr_range(jvma->start(), jvma->end()));
                     
                     if (jvma->start() < start) {
@@ -1827,12 +1830,12 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
                     }
                     auto range = find_free(jvma->end()-jvma->start());
                     jvma->set(range.start(), range.end());
-                    vma_list.insert(*jvma);
+                    vma_buddy_list.insert(*jvma);
                 } else {
                     // Note how v and jvma are different. This is because this one,
                     // we will delete.
                     auto& v = *i--;
-                    vma_list.erase(v);
+                    vma_buddy_list.erase(v);
                     add_free(addr_range(v.start(), v.end()));
                     // Finish the move. In practice, it will temporarily remap an
                     // anon mapping here, but this should be rare. Let's not
@@ -1847,7 +1850,7 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
         evacuate(start, start + size);
         auto nrange = find_free(vma->end()-vma->start());
         vma->set(nrange.start(), nrange.end());
-        vma_list.insert(*vma);
+        vma_buddy_list.insert(*vma);
         return vma->size();
     }
     return 0;
@@ -1900,19 +1903,11 @@ file_vma::~file_vma()
     delete _page_ops;
 }
 
-/*void file_vma::split(uintptr_t edge)
+// Not used in buddy implmenetation
+void file_vma::split(uintptr_t edge)
 {
-    if (edge <= _range.start() || edge >= _range.end()) {
-        return;
-    }
-    auto off = offset(edge);
-    vma *n = _file->mmap(addr_range(edge, _range.end()), _flags, _perm, off).release();
-    set(_range.start(), edge);
-    vma_list.insert(*n);
-    WITH_LOCK(vma_range_set_mutex.for_write()) {
-        vma_range_set.insert(vma_range(n));
-    }
-}*/
+    return;
+}
 
 error file_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -2088,7 +2083,7 @@ void free_initial_memory_range(uintptr_t addr, size_t size)
 error mprotect(const void *addr, size_t len, unsigned perm)
 {
     PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
+    SCOPE_LOCK(vma_buddy_list_mutex.for_write());
 
     if (!ismapped(addr, len)) {
         return make_error(ENOMEM);
@@ -2100,7 +2095,7 @@ error mprotect(const void *addr, size_t len, unsigned perm)
 error munmap(const void *addr, size_t length)
 {
     PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
+    SCOPE_LOCK(vma_buddy_list_mutex.for_write());
 
     length = align_up(length, mmu::page_size);
     if (!ismapped(addr, length)) {
@@ -2113,7 +2108,7 @@ error munmap(const void *addr, size_t length)
 
 error msync(const void* addr, size_t length, int flags)
 {
-    SCOPE_LOCK(vma_list_mutex.for_read());
+    SCOPE_LOCK(vma_buddy_list_mutex.for_read());
 
     if (!ismapped(addr, length)) {
         return make_error(ENOMEM);
@@ -2125,7 +2120,7 @@ error mincore(const void *addr, size_t length, unsigned char *vec)
 {
     char *end = align_up((char *)addr + length, page_size);
     char tmp;
-    SCOPE_LOCK(vma_list_mutex.for_read());
+    SCOPE_LOCK(vma_buddy_list_mutex.for_read());
     if (!is_linear_mapped(addr, length) && !ismapped(addr, length)) {
         return make_error(ENOMEM);
     }
@@ -2142,8 +2137,8 @@ error mincore(const void *addr, size_t length, unsigned char *vec)
 std::string procfs_maps()
 {
     std::ostringstream os;
-    WITH_LOCK(vma_list_mutex.for_read()) {
-        for (auto& vma : vma_list) {
+    WITH_LOCK(vma_buddy_list_mutex.for_read()) {
+        for (auto& vma : vma_buddy_list) {
             char read    = vma.perm() & perm_read  ? 'r' : '-';
             char write   = vma.perm() & perm_write ? 'w' : '-';
             char execute = vma.perm() & perm_exec  ? 'x' : '-';
@@ -2161,5 +2156,4 @@ std::string procfs_maps()
     }
     return os.str();
 }
-
 }

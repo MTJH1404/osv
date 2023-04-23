@@ -70,7 +70,7 @@ public:
     unsigned perm() const;
     unsigned flags() const;
     virtual void fault(uintptr_t addr, exception_frame *ef);
-    virtual void split(uintptr_t edge) = 0;
+    //virtual void split(uintptr_t edge) = 0;
     virtual error sync(uintptr_t start, uintptr_t end) = 0;
     virtual int validate_perm(unsigned perm) { return 0; }
     virtual page_allocator* page_ops();
@@ -124,7 +124,7 @@ struct vma_range {
 class anon_vma : public vma {
 public:
     anon_vma(addr_range range, unsigned perm, unsigned flags);
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
 };
 
@@ -132,7 +132,7 @@ class file_vma : public vma {
 public:
     file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops);
     ~file_vma();
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual int validate_perm(unsigned perm);
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
@@ -154,7 +154,7 @@ class jvm_balloon_vma : public vma {
 public:
     jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start, uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags);
     virtual ~jvm_balloon_vma();
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
     void detach_balloon();

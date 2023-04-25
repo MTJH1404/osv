@@ -30,10 +30,11 @@
 #include <numeric>
 #include <cmath>
 #include <set>
+#include <iostream>
 
 // FIXME: Without this pragma, we get a lot of warnings that I don't know
 // how to explain or fix. For now, let's just ignore them :-(
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
+//#pragma GCC diagnostic ignored "-Wstringop-overflow"
 
 extern void* elf_start;
 extern size_t elf_size;
@@ -105,12 +106,12 @@ struct vma_list_type : vma_list_base {
     vma_list_type() {
         // insert markers for the edges of allocatable area
         // simplifies searches
-        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
+        /*auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
         insert(*lower_edge);
         auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
-        insert(*upper_edge);
+        insert(*upper_edge);*/
 
-        for (uint i=0; i<max_powers; i++) vma_free_list.push_back(std::vector<addr_range>());
+        for (uint i=0; i<=max_powers; i++) vma_free_list.emplace_back();
         WITH_LOCK(vma_free_list_mutex.for_write()) {
             vma_free_list[max_powers].push_back(addr_range(lower_vma_limit, upper_vma_limit));
         }
@@ -1023,7 +1024,7 @@ addr_range find_free(uintptr_t size)
 {
     auto n = std::ceil(std::log(static_cast<float>(size)) / std::log(static_cast<float>(2)));
     SCOPE_LOCK(vma_free_list_mutex.for_read());
-    if (vma_free_list[n].size() > 0) {
+    if (!vma_free_list[n].empty()) {
         auto temp = vma_free_list[n][0];
 
         WITH_LOCK(vma_free_list_mutex.for_write()) {
@@ -1051,7 +1052,7 @@ addr_range find_free(uintptr_t size)
             
             for(; i >= n; i--) {
                 // divide block into two halves
-                auto split_size = align_up(temp.end()-temp.start()/2, mmu::page_size);
+                auto split_size = align_up((temp.end()-temp.start())/2, mmu::page_size);
                 addr_range pair1 = addr_range(temp.start(),
                                 temp.start() + split_size);
                 addr_range pair2 = addr_range(temp.start() + split_size + 1,
@@ -1145,8 +1146,25 @@ ulong evacuate(uintptr_t start, uintptr_t end)
 {
     auto range = find_intersecting_vmas(addr_range(start, end));
     ulong ret = 0;
+    std::vector<mmu::vma*> dead_list;
     for (auto i = range.first; i != range.second; ++i) {
-        ret += deallocate(i);
+        // If no such starting address available
+        auto& dead = *i--;
+        auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+        ret += size;
+        if (dead.has_flags(mmap_jvm_heap)) {
+            memory::stats::on_jvm_heap_free(size);
+        }
+        dead_list.push_back(&dead);
+
+        // Add the block in free list
+        add_free(addr_range(dead.start(), dead.end()));
+
+        // Remove the key existence from map
+        delete &dead;
+    }
+    for (auto &dead : dead_list) {
+        vma_list.erase(*dead);
     }
     return ret;
 }
@@ -1272,6 +1290,7 @@ public:
 
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
+    std::cout << "allocate " << start << "\n";
     if (!search) {
         evacuate(start, start + size);
     } 

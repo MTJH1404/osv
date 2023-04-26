@@ -62,6 +62,7 @@ public:
     vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr);
     virtual ~vma();
     void set(uintptr_t start, uintptr_t end);
+    void set_unhandled(uintptr_t start, uintptr_t end);
     void protect(unsigned perm);
     uintptr_t start() const;
     uintptr_t end() const;

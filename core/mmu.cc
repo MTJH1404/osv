@@ -1055,7 +1055,7 @@ addr_range find_free(uintptr_t size)
                 auto split_size = align_up((temp.end()-temp.start())/2, mmu::page_size);
                 addr_range pair1 = addr_range(temp.start(),
                                 temp.start() + split_size);
-                addr_range pair2 = addr_range(temp.start() + split_size + 1,
+                addr_range pair2 = addr_range(temp.start() + split_size,
                                 temp.end());
                                 
                 // push them in free list  
@@ -1290,7 +1290,6 @@ public:
 
 uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
 {
-    std::cout << "allocate " << start << "\n";
     if (!search) {
         evacuate(start, start + size);
     } 
@@ -1300,7 +1299,7 @@ uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
     auto free = find_free(size);
     start = free.start();
     size = free.end()-free.start();
-    v->set(start, start+size);
+    v->set_unhandled(start, start+size);
     vma_list.insert(*v);
     return start;
 }
@@ -1562,6 +1561,11 @@ vma::~vma()
 void vma::set(uintptr_t start, uintptr_t end)
 {
     _range = addr_range(align_down(start, mmu::page_size), align_up(end, mmu::page_size));
+}
+
+void vma::set_unhandled(uintptr_t start, uintptr_t end)
+{
+    _range = addr_range(start, end);
 }
 
 void vma::protect(unsigned perm)

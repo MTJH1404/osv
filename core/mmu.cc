@@ -1020,16 +1020,13 @@ public:
     bool operator()(uintptr_t x, const vma_range& y) const { return x < y.start(); }
 };
 
-addr_range find_free(uintptr_t size)
+addr_range find_free(size_t size)
 {
     auto n = std::ceil(std::log(static_cast<float>(size)) / std::log(static_cast<float>(2)));
-    SCOPE_LOCK(vma_free_list_mutex.for_read());
+    SCOPE_LOCK(vma_free_list_mutex.for_write());
     if (!vma_free_list[n].empty()) {
         auto temp = vma_free_list[n][0];
-
-        WITH_LOCK(vma_free_list_mutex.for_write()) {
-            vma_free_list[n].erase(vma_free_list[n].begin());
-        }
+        vma_free_list[n].erase(vma_free_list[n].begin());
         return temp;
     } else {
         uintptr_t i;
@@ -1045,9 +1042,7 @@ addr_range find_free(uintptr_t size)
             // if found
             addr_range temp = vma_free_list[i][0];
             // remove first block to split it into halves
-            WITH_LOCK(vma_free_list_mutex.for_write()) {
-                vma_free_list[i].erase(vma_free_list[i].begin());
-            }
+            vma_free_list[i].erase(vma_free_list[i].begin());
             i--;
             
             for(; i >= n; i--) {
@@ -1059,18 +1054,13 @@ addr_range find_free(uintptr_t size)
                                 temp.end());
                                 
                 // push them in free list  
-                WITH_LOCK(vma_free_list_mutex.for_write()) {
-                    vma_free_list[std::ceil(std::log(static_cast<float>(split_size)) / std::log(static_cast<float>(2)))].push_back(pair1);
-                    vma_free_list[std::ceil(std::log(static_cast<float>(pair2.end()-pair2.start())) / std::log(static_cast<float>(2)))].push_back(pair2);
-                }
+                vma_free_list[std::ceil(std::log(static_cast<float>(split_size)) / std::log(static_cast<float>(2)))].push_back(pair1);
+                vma_free_list[std::ceil(std::log(static_cast<float>(pair2.end()-pair2.start())) / std::log(static_cast<float>(2)))].push_back(pair2);
                 i = std::ceil(std::log(static_cast<float>(split_size)) / std::log(static_cast<float>(2))); // TODO check if necessary
                 temp = vma_free_list[i][0];
 
                 // remove first free block to further split
-
-                WITH_LOCK(vma_free_list_mutex.for_write()) {
-                    vma_free_list[i].erase(vma_free_list[i].begin());
-                }
+                vma_free_list[i].erase(vma_free_list[i].begin());
             }
             return temp;
         }
@@ -1104,13 +1094,10 @@ void add_free(addr_range range) {
                 
                 // Now merge the buddies to make
                 // them one large free memory block
-                if (buddyNumber % 2 == 0)
-                {
+                if (buddyNumber % 2 == 0) {
                     vma_free_list[n + 1].push_back(addr_range(id,
                     id + 2 * std::pow(2, n) - 1));
-                }
-                else
-                {
+                } else {
                     vma_free_list[n + 1].push_back(addr_range(
                         buddyAddress, buddyAddress +
                         2 * std::pow(2, n) - 1));
@@ -1121,25 +1108,6 @@ void add_free(addr_range range) {
             }
         }
     }
-}
-
-// Only deallocate existings vmas here //TODO
-ulong deallocate(vma_list_type::iterator vma) 
-{
-    // If no such starting address available
-    auto& dead = *vma;
-    auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-    if (dead.has_flags(mmap_jvm_heap)) {
-        memory::stats::on_jvm_heap_free(size);
-    }
-    vma_list.erase(dead);
- 
-    // Add the block in free list
-    add_free(addr_range(dead.start(), dead.end()));
- 
-    // Remove the key existence from map
-    delete &dead;
-    return size;
 }
 
 ulong evacuate(uintptr_t start, uintptr_t end)
@@ -1158,7 +1126,11 @@ ulong evacuate(uintptr_t start, uintptr_t end)
         dead_list.push_back(&dead);
 
         // Add the block in free list
-        add_free(addr_range(dead.start(), dead.end()));
+        if (dead.buddy_count() > 0) {
+            dead.free_buddies();
+        } else {
+            add_free(addr_range(dead.start(), dead.end()));
+        }
 
         // Remove the key existence from map
         delete &dead;
@@ -1167,6 +1139,118 @@ ulong evacuate(uintptr_t start, uintptr_t end)
         vma_list.erase(*dead);
     }
     return ret;
+}
+
+std::vector<addr_range> crop_front (addr_range range, uintptr_t start) 
+{
+    auto split_size = align_up((range.end()-range.start())/2, mmu::page_size);
+    std::vector<addr_range> buddies;
+    while (split_size > mmu::page_size && start - range.start() < mmu::page_size) {
+        if (range.start() + split_size < start) {
+            addr_range not_required = addr_range(range.start(), range.start() + split_size);
+            vma_free_list[std::ceil(std::log(static_cast<float>(split_size)) / std::log(static_cast<float>(2)))].push_back(not_required);
+            range = addr_range(range.start() + split_size, range.end());
+        } else {
+            addr_range back_range(range.start() + split_size, range.end());
+            buddies.push_back(back_range);
+            range = addr_range(range.start(), range.start() + split_size);
+        }
+    }
+    buddies.push_back(range);
+    return buddies;
+}
+
+std::vector<addr_range> crop_back (addr_range range, uintptr_t end) 
+{
+    auto split_size = align_up((range.end()-range.start())/2, mmu::page_size);
+    std::vector<addr_range> buddies;
+    while (split_size > mmu::page_size && range.end() - end < mmu::page_size) {
+        if (end < range.start() + split_size) {
+            addr_range not_required = addr_range(range.start() + split_size, range.end());
+            vma_free_list[std::ceil(std::log(static_cast<float>(split_size)) / std::log(static_cast<float>(2)))].push_back(not_required);
+            range = addr_range(range.start() + split_size, range.start() + split_size);
+        } else {
+            addr_range back_range(range.start() + split_size, range.end());
+            buddies.push_back(back_range);
+            range = addr_range(range.start(), range.start() + split_size);
+        }
+    }
+    buddies.push_back(range);
+    return buddies;
+}
+
+/**
+ * @brief evacuates specified area and guarantes that start and end lay in the aquired memory region. 
+ * The algorithm finds either one free buddy and reduces its size until it fits the requested range with as little memory as possible 
+ * or collects all free buddies which lay within the requested and crops the starting and the ending buddy to contain as little memory as possible 
+ * 
+ * @param start start of the requested memory region
+ * @param end end of the requested memory region
+ * @return ** std::pair<addr_range, std::vector<addr_range>> pair containing first the reserved memory region and second the buddies allocated for this region
+ */
+std::pair<addr_range, std::vector<addr_range>> aquire_fixed(uintptr_t start, uintptr_t end) 
+{
+    evacuate(start, end);
+    std::vector<addr_range> buddies;
+    bool memory_aquired = false;
+    uintptr_t reserved_start = start;
+    uintptr_t reserved_end = end;
+    WITH_LOCK(vma_free_list_mutex.for_write()) {
+        for (auto i = max_powers; i >= 0; i++) {
+            for (auto j = vma_free_list[i].begin(); j != vma_free_list[i].end(); ) {
+                addr_range range = *j;
+                if (range.start() <= start && end <= range.end()) {
+                    j = vma_free_list[i].erase(j);
+                    auto split_size = align_up((range.end()-range.start())/2, mmu::page_size);
+                    while (range.start() + split_size < start || end < range.start() + split_size) {
+                        addr_range not_required (0,0);
+                        if (range.start() + split_size < start) {
+                            not_required = addr_range(range.start(), range.start() + split_size);
+                            range = addr_range(range.start() + split_size, range.end());
+                        } else {
+                            not_required = addr_range(range.start() + split_size, range.end());
+                            range = addr_range(range.start(), range.start() + split_size);
+                        }
+                        vma_free_list[std::ceil(std::log(static_cast<float>(not_required.end()-not_required.start())) / std::log(static_cast<float>(2)))].push_back(not_required);
+                        split_size = align_up((range.end()-range.start())/2, mmu::page_size);
+                        // crop unnecassary memory from the front and back
+                        addr_range front_range(range.start(), range.start() + split_size);
+                        addr_range back_range(range.start() + split_size, range.end());
+                        auto front_buddies = crop_front(front_range, start);
+                        auto back_buddies = crop_back(back_range, end);
+                        reserved_start = front_buddies.end()->start();
+                        reserved_end = back_buddies.end()->end();
+                        if (reserved_start == range.start() && reserved_end == range.end()) {
+                            // nothing was cropped from the range
+                            buddies.push_back(range);
+                        } else {
+                            buddies.insert(buddies.end(), front_buddies.begin(), front_buddies.end());
+                            buddies.insert(buddies.end(), back_buddies.begin(), back_buddies.end());
+                        }
+                        memory_aquired = true;
+                        break;
+                    }
+                } else if (start < range.start() && range.end() < end) { // buddy within the requested memory region
+                    j = vma_free_list[i].erase(j);
+                    buddies.push_back(range);
+                }  else if (range.start() <= start && start < range.end() ) { // buddy containing the start address
+                    j = vma_free_list[i].erase(j);
+                    auto cropped = crop_front(range, start);
+                    reserved_start = cropped.end()->start();
+                    buddies.insert(buddies.end(), cropped.begin(), cropped.end());
+                } else if (range.start() < end && end <= range.end()) { // buddy containing the end address 
+                    j = vma_free_list[i].erase(j);
+                    auto cropped = crop_front(range, start);
+                    reserved_end = cropped.end()->end();
+                    buddies.insert(buddies.end(), cropped.begin(), cropped.end());
+                } else { // buddy outside of the requested area
+                    ++j;
+                }
+            }
+            if (memory_aquired) break;
+        }
+    }
+    return {addr_range(reserved_start, reserved_end), buddies};
 }
 
 static void unmap(const void* addr, size_t size)
@@ -1288,20 +1372,30 @@ public:
     }
 };
 
-uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
+uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search, bool use_reserved = false)
 {
+    if (use_reserved) { // TODO add check if area is reserved
+        // the given range was already reserved, memory distribution needs to handled by reserving party
+        v->set(start, start+size);
+        vma_list.insert(*v);
+        return start;
+    }
     if (!search) {
-        evacuate(start, start + size);
-    } 
+        // aquires memory range as requested use only if necessary, consider reserving area instead
+        auto res = aquire_fixed(start, start + size);
+        v->set_unhandled(res.first.start(), res.first.end());
+        v->set_buddies(res.second);
+        vma_list.insert(*v);
+        return res.first.start();
+    }
     if (!start) {
         start = 0x200000000000ul;
     }
     auto free = find_free(size);
     start = free.start();
-    size = free.end()-free.start();
-    v->set_unhandled(start, start+size);
+    v->set_unhandled(free.start(), free.end());
     vma_list.insert(*v);
-    return start;
+    return free.start();
 }
 
 inline bool in_vma_range(void* addr)
@@ -1399,7 +1493,20 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
     return total;
 }
 
-void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
+std::pair<void*,void*> reserve_memory_region(const void * _start, const void* _end, bool address_fixed, unsigned perm, unsigned flags)
+{
+    auto start = reinterpret_cast<uintptr_t>(_start);
+    auto end = reinterpret_cast<uintptr_t>(_end);
+    auto size = align_up(end-start, mmu::page_size);
+    assert(start < upper_vma_limit && end <= upper_vma_limit);
+    auto* vma = new mmu::reserved_vma(addr_range(start, end), perm, flags);
+    PREVENT_STACK_PAGE_FAULT
+    SCOPE_LOCK(vma_list_mutex.for_write());
+    start = allocate(vma,start,size,true);
+    return {reinterpret_cast<void*>(start),reinterpret_cast<void*>(vma->end())}; //todo check
+}
+
+void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm, bool use_reserved)
 {
     bool search = !(flags & mmap_fixed);
     size = align_up(size, mmu::page_size);
@@ -1407,7 +1514,7 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
     auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
     PREVENT_STACK_PAGE_FAULT
     SCOPE_LOCK(vma_list_mutex.for_write());
-    auto v = (void*) allocate(vma, start, size, search);
+    auto v = (void*) allocate(vma, start, size, search, use_reserved);
     if (flags & mmap_populate) {
         populate_vma(vma, v, size);
     }
@@ -1425,7 +1532,7 @@ std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned f
 }
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
-              fileref f, f_offset offset)
+              fileref f, f_offset offset, bool use_reserved)
 {
     bool search = !(flags & mmu::mmap_fixed);
     size = align_up(size, mmu::page_size);
@@ -1434,7 +1541,7 @@ void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
     void *v;
     PREVENT_STACK_PAGE_FAULT
     WITH_LOCK(vma_list_mutex.for_write()) {
-        v = (void*) allocate(vma, start, size, search);
+        v = (void*) allocate(vma, start, size, search, use_reserved);
         if (flags & mmap_populate) {
             populate_vma(vma, v, std::min(size, align_up(::size(f), page_size)));
         }
@@ -1545,12 +1652,13 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     trace_mmu_vm_fault_ret(addr, ef->get_error());
 }
 
-vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops)
+vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, bool is_reserved, page_allocator *page_ops)
     : _range(align_down(range.start(), mmu::page_size), align_up(range.end(), mmu::page_size))
     , _perm(perm)
     , _flags(flags)
     , _map_dirty(map_dirty)
     , _page_ops(page_ops)
+    , _is_reserved(is_reserved)
 {
 }
 
@@ -1566,6 +1674,23 @@ void vma::set(uintptr_t start, uintptr_t end)
 void vma::set_unhandled(uintptr_t start, uintptr_t end)
 {
     _range = addr_range(start, end);
+}
+
+void vma::set_buddies(std::vector<addr_range> buddies)
+{
+    _buddies = buddies;
+}
+
+void vma::free_buddies()
+{
+    for (auto& buddy : _buddies) {
+        add_free(buddy);
+    }
+}
+
+size_t vma::buddy_count()
+{
+    return _buddies.size();
 }
 
 void vma::protect(unsigned perm)
@@ -1659,8 +1784,18 @@ static uninitialized_anonymous_page_provider page_allocator_noinit;
 static initialized_anonymous_page_provider page_allocator_init;
 static page_allocator *page_allocator_noinitp = &page_allocator_noinit, *page_allocator_initp = &page_allocator_init;
 
+reserved_vma::reserved_vma(addr_range range, unsigned perm, unsigned flags)
+    : vma(range, perm, flags, true, true)
+{
+}
+
+error reserved_vma::sync(uintptr_t start, uintptr_t end)
+{
+    return no_error();
+}
+
 anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
-    : vma(range, perm, flags, true, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp)
+    : vma(range, perm, flags, true, false, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp)
 {
 }
 
@@ -1676,7 +1811,7 @@ error anon_vma::sync(uintptr_t start, uintptr_t end)
 // not count on it being initialized to any value.
 jvm_balloon_vma::jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start,
                                  uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags)
-    : vma(addr_range(start, end), perm_rw, flags | mmap_jvm_balloon, true, page_allocator_noinitp),
+    : vma(addr_range(start, end), perm_rw, flags | mmap_jvm_balloon, true, false, page_allocator_noinitp),
       _balloon(b), _jvm_addr(jvm_addr),
       _real_perm(perm), _real_flags(flags & ~mmap_jvm_balloon), _real_size(end - start)
 {
@@ -1877,7 +2012,7 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
 }
 
 file_vma::file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator* page_ops)
-    : vma(range, perm, flags | mmap_small, !(flags & mmap_shared), page_ops)
+    : vma(range, perm, flags | mmap_small, !(flags & mmap_shared), false, page_ops)
     , _file(file)
     , _offset(offset)
 {
@@ -2079,10 +2214,6 @@ void linear_map(void* _virt, phys addr, size_t size, const char* name,
     uintptr_t virt = reinterpret_cast<uintptr_t>(_virt);
     slop = std::min(slop, page_size_level(nr_page_sizes - 1));
     assert((virt & (slop - 1)) == (addr & (slop - 1)));
-    auto temp = find_free(size);
-    virt = temp.start();
-    size = temp.end()-temp.start();
-    // _virt = reinterpret_cast<void*>(virt); TODO
     linear_page_mapper phys_map(addr, size, mem_attr);
     map_range(virt, virt, size, phys_map, slop);
     auto _vma = new linear_vma(_virt, addr, size, mem_attr, name);

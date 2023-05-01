@@ -386,7 +386,7 @@ public:
     void copy_local_tls(void* to_addr);
     void* eh_frame_addr() { return _eh_frame; }
 protected:
-    virtual void load_segment(const Elf64_Phdr& segment) = 0;
+    virtual void load_segment(Elf64_Phdr& segment) = 0;
     virtual void unload_segment(const Elf64_Phdr& segment) = 0;
     virtual void read(Elf64_Off offset, void* data, size_t len) = 0;
     bool mlocked();
@@ -439,6 +439,8 @@ protected:
     bool is_core();
     bool _init_called;
     void* _eh_frame;
+    bool _memory_reserved = false;
+    std::pair<void*, void*> _reserved_memory;
 
     std::unordered_map<std::string,void*> _cached_symbols;
 
@@ -483,8 +485,8 @@ public:
     void load_program_headers();
     void load_elf_header();
 protected:
-    virtual void load_segment(const Elf64_Phdr& phdr);
-    virtual void unload_segment(const Elf64_Phdr& phdr);
+    virtual void load_segment(Elf64_Phdr& phdr);
+    virtual void unload_segment(const Elf64_Phdr& phdr) override;
     virtual void read(Elf64_Off offset, void* data, size_t size) override;
 private:
     ::fileref _f;
@@ -494,7 +496,7 @@ class memory_image : public object {
 public:
     explicit memory_image(program& prog, void* base);
 protected:
-    virtual void load_segment(const Elf64_Phdr& phdr);
+    virtual void load_segment(Elf64_Phdr& phdr);
     virtual void unload_segment(const Elf64_Phdr& phdr);
     virtual void read(Elf64_Off offset, void* data, size_t size) override;
 };

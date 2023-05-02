@@ -470,19 +470,23 @@ extern "C" char _pie_static_tls_start, _pie_static_tls_end;
 void object::load_segments()
 {
     elf_debug("Loading segments\n");
-    debug_early("NEW LOAD\n");
-    if (is_non_pie_executable()) {
+    /*debug_early("NEW LOAD\n");
+    if (is_core()) {
+        if (is_non_pie_executable()) {
+            debug_early("non pie core\n");
+        } else {
+            debug_early("core\n");
+        }
+    } else if (is_non_pie_executable()) {
         debug_early("non pie\n");
-    } else if (is_core()) {
-        debug_early("core\n");
     } else {
         debug_early("pie\n");
-    }
-    debug_early(("_base: " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());
+    }*/
+    //debug_early(("_base: " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());
     for (unsigned i = 0; i < _ehdr.e_phnum; ++i) {
         auto &phdr = _phdrs[i];
         if (phdr.p_type == PT_LOAD) {
-            debug_early(("load: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr + phdr.p_memsz)) + " \n").c_str());
+            //debug_early(("load: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr + phdr.p_memsz)) + " \n").c_str());
             load_segment(phdr);
         }
     }
@@ -648,7 +652,10 @@ template <typename T>
 T* object::dynamic_ptr(unsigned tag)
 {
     auto addr = _base + dynamic_tag(tag).d_un.d_ptr;
-    debug_early(("addr " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + " \n").c_str());
+    /*uintptr_t temp = 0x80008000;
+    if (reinterpret_cast<uintptr_t>(_base) == temp){
+        debug_early(("addr " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + " \n").c_str());
+    }*/
     return static_cast<T*>(addr);
 }
 
@@ -664,7 +671,7 @@ const char* object::dynamic_str(unsigned tag)
 
 bool object::dynamic_exists(unsigned tag)
 {
-    debug_early("dynamic_exists \n");
+    // debug_early("dynamic_exists \n");
     return _dynamic_tag(tag);
 }
 
@@ -1466,6 +1473,7 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
         _modules_rcu.assign(new_modules.release());
         osv::rcu_dispose(old_modules);
         ef->load_segments();
+        //mmu::print_vmas();
         ef->process_headers();
         if (!ef->is_non_pie_executable())
            _next_alloc = ef->end();

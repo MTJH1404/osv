@@ -22,10 +22,12 @@ void page_fault(exception_frame *ef)
     SCOPE_LOCK(fpu);
     sched::exception_guard g;
     auto addr = processor::read_cr2();
+    //debug_early(("pf addr " + std::to_string(addr) + " \n").c_str());
     if (fixup_fault(ef)) {
         return;
     }
     auto pc = reinterpret_cast<void*>(ef->rip);
+    //debug_early(("pf pc " + std::to_string(ef->rip) + " \n").c_str());
     if (!pc) {
         abort("trying to execute null pointer");
     }

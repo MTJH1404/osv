@@ -59,11 +59,12 @@ struct linear_vma {
 
 class vma {
 public:
-    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, bool is_reserved, page_allocator *page_ops = nullptr);
+    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, bool is_reserved, bool _on_reserved = false, page_allocator *page_ops = nullptr);
     virtual ~vma();
     void set(uintptr_t start, uintptr_t end);
     void set_unhandled(uintptr_t start, uintptr_t end);
     void set_buddies(std::vector<addr_range> buddies);
+    void set_used_reservation(bool used_reservation) { _on_reserved = used_reservation; };
     void free_buddies();
     size_t buddy_count();
     void protect(unsigned perm);
@@ -84,6 +85,7 @@ public:
     template<typename T> ulong operate_range(T mapper);
     bool map_dirty();
     bool is_reservation() { return _is_reserved; };
+    bool has_used_reservation() { return _on_reserved; };
     class addr_compare;
 protected:
     addr_range _range;
@@ -92,6 +94,7 @@ protected:
     bool _map_dirty;
     page_allocator *_page_ops;
     bool _is_reserved;
+    bool _on_reserved;
     std::vector<addr_range> _buddies;
 public:
     boost::intrusive::set_member_hook<> _vma_list_hook;
@@ -137,14 +140,14 @@ public:
 
 class anon_vma : public vma {
 public:
-    anon_vma(addr_range range, unsigned perm, unsigned flags);
+    anon_vma(addr_range range, unsigned perm, unsigned flags, bool on_reserved = false);
     //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
 };
 
 class file_vma : public vma {
 public:
-    file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops);
+    file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops, bool on_reserved = false);
     ~file_vma();
     //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
@@ -383,6 +386,7 @@ unsigned long all_vmas_size();
 
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);
+void print_vmas();
 }
 
 #endif /* MMU_HH */

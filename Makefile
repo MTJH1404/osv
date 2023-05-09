@@ -848,6 +848,7 @@ libtsm += drivers/libtsm/tsm_vte.o
 libtsm += drivers/libtsm/tsm_vte_charsets.o
 
 drivers := $(bsd)
+drivers += core/dyn_alloc.o
 drivers += core/mmu.o
 drivers += arch/$(arch)/early-console.o
 drivers += drivers/console.o
@@ -1604,6 +1605,7 @@ libc += stdio/fgetc.o
 musl += stdio/fgetln.o
 musl += stdio/fgetpos.o
 musl += stdio/fgets.o
+musl += stdio/fgets_chk.o
 musl += stdio/fgetwc.o
 musl += stdio/fgetws.o
 musl += stdio/fileno.o

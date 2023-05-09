@@ -59,14 +59,9 @@ struct linear_vma {
 
 class vma {
 public:
-    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, bool is_reserved, bool _on_reserved = false, page_allocator *page_ops = nullptr);
+    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr);
     virtual ~vma();
     void set(uintptr_t start, uintptr_t end);
-    void set_unhandled(uintptr_t start, uintptr_t end);
-    void set_buddies(std::vector<addr_range> buddies);
-    void set_used_reservation(bool used_reservation) { _on_reserved = used_reservation; };
-    void free_buddies();
-    size_t buddy_count();
     void protect(unsigned perm);
     uintptr_t start() const;
     uintptr_t end() const;
@@ -75,17 +70,16 @@ public:
     unsigned perm() const;
     unsigned flags() const;
     virtual void fault(uintptr_t addr, exception_frame *ef);
-    //virtual void split(uintptr_t edge) = 0;
+    virtual void split(uintptr_t edge) = 0;
     virtual error sync(uintptr_t start, uintptr_t end) = 0;
-    virtual int validate_perm(unsigned perm) { return 0; }
+    virtual int validate_perm(unsigned perm) { return 0; };
     virtual page_allocator* page_ops();
     void update_flags(unsigned flag);
     bool has_flags(unsigned flag);
     template<typename T> ulong operate_range(T mapper, void *start, size_t size);
     template<typename T> ulong operate_range(T mapper);
     bool map_dirty();
-    bool is_reservation() { return _is_reserved; };
-    bool has_used_reservation() { return _on_reserved; };
+    addr_range range() { return _range; };
     class addr_compare;
 protected:
     addr_range _range;
@@ -93,9 +87,6 @@ protected:
     unsigned _flags;
     bool _map_dirty;
     page_allocator *_page_ops;
-    bool _is_reserved;
-    bool _on_reserved;
-    std::vector<addr_range> _buddies;
 public:
     boost::intrusive::set_member_hook<> _vma_list_hook;
 };
@@ -131,25 +122,18 @@ struct vma_range {
     }
 };
 
-class reserved_vma : public vma {
-public:
-    reserved_vma(addr_range range, unsigned perm, unsigned flags);
-    //virtual void split(uintptr_t edge) override;
-    virtual error sync(uintptr_t start, uintptr_t end) override;
-};
-
 class anon_vma : public vma {
 public:
-    anon_vma(addr_range range, unsigned perm, unsigned flags, bool on_reserved = false);
-    //virtual void split(uintptr_t edge) override;
+    anon_vma(addr_range range, unsigned perm, unsigned flags);
+    virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
 };
 
 class file_vma : public vma {
 public:
-    file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops, bool on_reserved = false);
+    file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops);
     ~file_vma();
-    //virtual void split(uintptr_t edge) override;
+    virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual int validate_perm(unsigned perm);
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
@@ -171,7 +155,7 @@ class jvm_balloon_vma : public vma {
 public:
     jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start, uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags);
     virtual ~jvm_balloon_vma();
-    //virtual void split(uintptr_t edge) override;
+    virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
     void detach_balloon();
@@ -214,10 +198,8 @@ public:
 };
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
-              fileref file, f_offset offset, bool use_reserved = false);
-void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm, bool use_reserved = false);
-
-std::pair<void*,void*> reserve_memory_region(const void * _start, const void* _end, bool address_fixed = false, unsigned perm = 0, unsigned flags = 0);
+              fileref file, f_offset offset);
+void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
 
 error munmap(const void* addr, size_t size);
 error mprotect(const void *addr, size_t size, unsigned int perm);
@@ -386,7 +368,6 @@ unsigned long all_vmas_size();
 
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);
-void print_vmas();
 }
 
 #endif /* MMU_HH */

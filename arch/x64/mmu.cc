@@ -36,6 +36,7 @@ void page_fault(exception_frame *ef)
     }
     // The following code may sleep. So let's verify the fault did not happen
     // when preemption was disabled, or interrupts were disabled.
+    //mmu::print_vmas();
     assert(sched::preemptable());
     assert(ef->rflags & processor::rflags_if);
 

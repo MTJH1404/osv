@@ -29,7 +29,6 @@
 #include <osv/export.h>
 #include <boost/version.hpp>
 #include <deque>
-#include <map>
 
 #include "arch.hh"
 #include "arch-elf.hh"
@@ -276,7 +275,7 @@ memory_image::memory_image(program& prog, void* base)
     _phdrs.assign(p, p + _ehdr.e_phnum);
 }
 
-void memory_image::load_segment(Elf64_Phdr& phdr)
+void memory_image::load_segment(const Elf64_Phdr& phdr)
 {
 }
 
@@ -379,14 +378,8 @@ void object::set_base(void* base)
         // Otherwise for kernel, PIEs and shared libraries set the base as requested by caller
         _base = align(base, p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
     }
+
     _end = _base + q->p_vaddr + q->p_memsz;
-    // find reserve memory region for object
-    if(!is_non_pie_executable() || is_core()) {
-        _reserved_memory = mmu::reserve_memory_region(_base, _end, is_core());
-        _base = _reserved_memory.first;
-        _end = _reserved_memory.second;
-        _memory_reserved = true;
-    }
     elf_debug("The base set to: %018p and end: %018p\n", _base, _end);
 }
 
@@ -410,7 +403,7 @@ void file::load_program_headers()
     }
 }
 
-void file::load_segment(Elf64_Phdr& phdr)
+void file::load_segment(const Elf64_Phdr& phdr)
 {
     ulong vstart = align_down(phdr.p_vaddr, mmu::page_size);
     ulong filesz_unaligned = phdr.p_vaddr + phdr.p_filesz - vstart;
@@ -420,15 +413,15 @@ void file::load_segment(Elf64_Phdr& phdr)
     unsigned perm = get_segment_mmap_permissions(phdr);
 
     auto flag = mmu::mmap_fixed | (mlocked() ? mmu::mmap_populate : 0);
-    mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size), _memory_reserved);
+    mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size));
     if (phdr.p_filesz != phdr.p_memsz) {
         assert(perm & mmu::perm_write);
         memset(_base + vstart + filesz_unaligned, 0, filesz - filesz_unaligned);
         if (memsz != filesz) {
-            mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm, _memory_reserved);
+            mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm);
         }
     }
-    elf_debug("Loaded and mapped PT_LOAD segment at: %018p of size: 0x%x\n", addr, size);
+    elf_debug("Loaded and mapped PT_LOAD segment at: %018p of size: 0x%x\n", _base + vstart, filesz);
 }
 
 bool object::mlocked()
@@ -470,23 +463,9 @@ extern "C" char _pie_static_tls_start, _pie_static_tls_end;
 void object::load_segments()
 {
     elf_debug("Loading segments\n");
-    /*debug_early("NEW LOAD\n");
-    if (is_core()) {
-        if (is_non_pie_executable()) {
-            debug_early("non pie core\n");
-        } else {
-            debug_early("core\n");
-        }
-    } else if (is_non_pie_executable()) {
-        debug_early("non pie\n");
-    } else {
-        debug_early("pie\n");
-    }*/
-    //debug_early(("_base: " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());
     for (unsigned i = 0; i < _ehdr.e_phnum; ++i) {
         auto &phdr = _phdrs[i];
         if (phdr.p_type == PT_LOAD) {
-            //debug_early(("load: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr)) + " end: " + std::to_string(reinterpret_cast<uintptr_t>(_base + phdr.p_vaddr + phdr.p_memsz)) + " \n").c_str());
             load_segment(phdr);
         }
     }
@@ -599,10 +578,7 @@ void object::unload_segments()
         default:
             break;
         }
-    }
-    if (_memory_reserved) {
-        // TODO
-    }
+     }
 }
 
 unsigned object::get_segment_mmap_permissions(const Elf64_Phdr& phdr)
@@ -651,12 +627,7 @@ void object::make_text_writable(bool flag)
 template <typename T>
 T* object::dynamic_ptr(unsigned tag)
 {
-    auto addr = _base + dynamic_tag(tag).d_un.d_ptr;
-    /*uintptr_t temp = 0x80008000;
-    if (reinterpret_cast<uintptr_t>(_base) == temp){
-        debug_early(("addr " + std::to_string(reinterpret_cast<uintptr_t>(addr)) + " \n").c_str());
-    }*/
-    return static_cast<T*>(addr);
+    return static_cast<T*>(_base + dynamic_tag(tag).d_un.d_ptr);
 }
 
 Elf64_Xword object::dynamic_val(unsigned tag)
@@ -671,7 +642,6 @@ const char* object::dynamic_str(unsigned tag)
 
 bool object::dynamic_exists(unsigned tag)
 {
-    // debug_early("dynamic_exists \n");
     return _dynamic_tag(tag);
 }
 
@@ -703,7 +673,6 @@ object::dynamic_str_array(unsigned tag)
     auto strtab = dynamic_ptr<const char>(DT_STRTAB);
     std::vector<const char *> r;
     for (auto p = _dynamic_table; p->d_tag != DT_NULL; ++p) {
-        //debug_early(("d_tag: " + std::to_string(p->d_tag) + "/n").c_str());
         if (p->d_tag == tag) {
             r.push_back(strtab + p->d_un.d_val);
         }
@@ -1473,7 +1442,6 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
         _modules_rcu.assign(new_modules.release());
         osv::rcu_dispose(old_modules);
         ef->load_segments();
-        //mmu::print_vmas();
         ef->process_headers();
         if (!ef->is_non_pie_executable())
            _next_alloc = ef->end();

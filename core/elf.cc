@@ -380,6 +380,12 @@ void object::set_base(void* base)
     }
 
     _end = _base + q->p_vaddr + q->p_memsz;
+    if (!is_non_pie_executable()) {
+        auto reservation = mmu::reserve_memory_region(_base, _end);
+        _base = align(reinterpret_cast<void*>(reservation.start()), p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
+        _use_reservation = true;
+    }
+
     elf_debug("The base set to: %018p and end: %018p\n", _base, _end);
 }
 

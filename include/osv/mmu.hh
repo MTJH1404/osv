@@ -62,6 +62,8 @@ public:
     vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr);
     virtual ~vma();
     void set(uintptr_t start, uintptr_t end);
+    void set_ranges(std::vector<addr_range> ranges);
+    void set_on_reserved(bool used_reservation) { _on_reserved = used_reservation; };
     void protect(unsigned perm);
     uintptr_t start() const;
     uintptr_t end() const;
@@ -70,7 +72,7 @@ public:
     unsigned perm() const;
     unsigned flags() const;
     virtual void fault(uintptr_t addr, exception_frame *ef);
-    virtual void split(uintptr_t edge) = 0;
+    //virtual void split(uintptr_t edge) = 0;
     virtual error sync(uintptr_t start, uintptr_t end) = 0;
     virtual int validate_perm(unsigned perm) { return 0; };
     virtual page_allocator* page_ops();
@@ -80,6 +82,10 @@ public:
     template<typename T> ulong operate_range(T mapper);
     bool map_dirty();
     addr_range range() { return _range; };
+    std::vector<addr_range> ranges() { return _ranges; };
+    void free_range();
+    bool is_reservation() const { return _is_reserved; };
+    bool has_used_reservation() const { return _on_reserved; };
     class addr_compare;
 protected:
     addr_range _range;
@@ -87,6 +93,9 @@ protected:
     unsigned _flags;
     bool _map_dirty;
     page_allocator *_page_ops;
+    std::vector<addr_range> _ranges;
+    bool _is_reserved = false;
+    bool _on_reserved = false;
 public:
     boost::intrusive::set_member_hook<> _vma_list_hook;
 };
@@ -122,10 +131,17 @@ struct vma_range {
     }
 };
 
+class reserved_vma : public vma {
+public:
+    reserved_vma(addr_range range, unsigned perm, unsigned flags);
+    //virtual void split(uintptr_t edge) override;
+    virtual error sync(uintptr_t start, uintptr_t end) override;
+};
+
 class anon_vma : public vma {
 public:
     anon_vma(addr_range range, unsigned perm, unsigned flags);
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
 };
 
@@ -133,7 +149,7 @@ class file_vma : public vma {
 public:
     file_vma(addr_range range, unsigned perm, unsigned flags, fileref file, f_offset offset, page_allocator *page_ops);
     ~file_vma();
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual int validate_perm(unsigned perm);
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
@@ -155,7 +171,7 @@ class jvm_balloon_vma : public vma {
 public:
     jvm_balloon_vma(unsigned char *jvm_addr, uintptr_t start, uintptr_t end, balloon_ptr b, unsigned perm, unsigned flags);
     virtual ~jvm_balloon_vma();
-    virtual void split(uintptr_t edge) override;
+    //virtual void split(uintptr_t edge) override;
     virtual error sync(uintptr_t start, uintptr_t end) override;
     virtual void fault(uintptr_t addr, exception_frame *ef) override;
     void detach_balloon();
@@ -198,8 +214,9 @@ public:
 };
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
-              fileref file, f_offset offset);
-void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
+              fileref file, f_offset offset, bool use_reserved = false);
+void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm, bool use_reserved = false);
+addr_range reserve_memory_region(const void * _start, const void* _end);
 
 error munmap(const void* addr, size_t size);
 error mprotect(const void *addr, size_t size, unsigned int perm);
@@ -368,6 +385,7 @@ unsigned long all_vmas_size();
 
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);
+void print_vmas();
 }
 
 #endif /* MMU_HH */

@@ -105,6 +105,7 @@ struct vma_list_type : vma_list_base {
 
 __attribute__((init_priority((int)init_prio::vma_list)))
 vma_list_type vma_list;
+vma_list_type reservation_list;
 
 // protects vma list and page table modifications.
 // anything that may add, remove, split vma, zaps pte or changes pte permission
@@ -968,6 +969,32 @@ find_intersecting_vmas(const addr_range& r)
     return {start, end};
 }
 
+static inline std::pair<vma_list_type::iterator, vma_list_type::iterator>
+find_intersecting_vmas_reserved(const addr_range& r)
+{
+    if (r.end() <= r.start()) { // empty range, so nothing matches
+        return {reservation_list.end(), reservation_list.end()};
+    }
+    auto start = reservation_list.lower_bound(r.start(), addr_compare());
+    if (start->start() > r.start()) {
+        // The previous vma might also intersect with our range if it ends
+        // after our range's start.
+        auto prev = std::prev(start);
+        if (prev->end() > r.start()) {
+            start = prev;
+        }
+    }
+    // If the start vma is actually beyond the end of the search range,
+    // there is no intersection.
+    if (start->start() >= r.end()) {
+        return {reservation_list.end(), reservation_list.end()};
+    }
+    // end is the first vma starting >= r.end(), so any previous vma (after
+    // start) surely started < r.end() so is part of the intersection.
+    auto end = reservation_list.lower_bound(r.end(), addr_compare());
+    return {start, end};
+}
+
 
 /**
  * Change virtual memory range protection
@@ -989,8 +1016,8 @@ static error protect(const void *addr, size_t size, unsigned int perm)
         if (err != 0) {
             return make_error(err);
         }
-        i->split(end);
-        i->split(start);
+        //i->split(end);
+        //i->split(start);
         if (contains(start, end, *i)) {
             i->protect(perm);
             i->operate_range(protection(perm));
@@ -1008,21 +1035,43 @@ public:
 ulong evacuate(uintptr_t start, uintptr_t end)
 {
     auto range = find_intersecting_vmas(addr_range(start, end));
+    auto reserved_range = find_intersecting_vmas_reserved(addr_range(start, end));
     ulong ret = 0;
-    for (auto i = range.first; i != range.second; ++i) {
-        i->split(end);
-        i->split(start);
-        if (contains(start, end, *i)) {
-            auto& dead = *i--;
-            auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-            ret += size;
-            if (dead.has_flags(mmap_jvm_heap)) {
-                memory::stats::on_jvm_heap_free(size);
-            }
-            vma_list.erase(dead);
-            add_free(dead.range());
-            delete &dead;
+    //debug_early(("evac start: " + std::to_string(start) + " end: " + std::to_string(end) + " \n").c_str());
+    for (auto i = reserved_range.first; i != reserved_range.second; ++i) {
+        //i->split(end);
+        //i->split(start);
+        //if (contains(start, end, *i) || ) {
+            
+        //}
+        auto& dead = *i--;
+        auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+        //ret += size;
+        if (dead.has_flags(mmap_jvm_heap)) {
+            memory::stats::on_jvm_heap_free(size);
         }
+        reservation_list.erase(dead);
+        //debug_early(("evac reserved dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+        dead.free_range();
+        delete &dead;
+    }
+    //print_vmas();
+    for (auto i = range.first; i != range.second; ++i) {
+        //i->split(end);
+        //i->split(start);
+        //if (contains(start, end, *i) || ) {
+            
+        //}
+        auto& dead = *i--;
+        auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+        ret += size;
+        if (dead.has_flags(mmap_jvm_heap)) {
+            memory::stats::on_jvm_heap_free(size);
+        }
+        vma_list.erase(dead);
+        //debug_early(("evac dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+        dead.free_range();
+        delete &dead;
     }
     return ret;
     // FIXME: range also indicates where we can insert a new anon_vma, use it
@@ -1147,26 +1196,42 @@ public:
     }
 };
 
-uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
+uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search, bool use_reserved)
 {
-    if (search) {
-        // search for unallocated hole around start
-        if (!start) {
-            start = 0x200000000000ul;
-        }
-        auto addr = find_free(size);
-        start = addr.start();
-    } else {
-        // we don't know if the given range is free, need to evacuate it first
-        evacuate(start, start+size);
-        auto addr = aquire_fixed(start, start+size);
-        assert(addr.start() == start);
+    std::vector<addr_range> ranges;
+    //debug_early(("allocate : " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
+    //debug_early("allocate \n");
+    if (use_reserved) { // TODO add check if area is reserved
+        //debug_early("allocate reserved\n");
+        // the given range was already reserved, memory distribution needs to handled by reserving party
+        v->set(start, start+size);
+        //debug_early(("allocate reserved start: " + std::to_string(v->start()) + " end: " + std::to_string(v->end()) + " \n").c_str());
+        v->set_on_reserved(true);
+        vma_list.insert(*v);
+        return v->start();
     }
-    v->set(start, start+size);
-
-    vma_list.insert(*v);
-
-    return start;
+    if (!search) {
+        // aquires memory range as requested use only if necessary, consider reserving area instead
+        //debug_early("allocate fixed\n");
+        evacuate(start, start+size);
+        auto res = aquire_fixed(start, start + size);
+        //debug_early(("allocate fixed start: " + std::to_string(res.start()) + " end: " + std::to_string(res.end()) + " \n").c_str());
+        v->set(start, start+size);
+        v->set_ranges(res);
+        vma_list.insert(*v);
+        return start;
+    }
+    //debug_early("allocate search\n");
+    auto free = find_free(size);
+    start = free.start();
+    //debug_early(("allocate search start: " + std::to_string(free.start()) + " end: " + std::to_string(free.end()) + " \n").c_str());
+    v->set(free.start(), free.end());
+    if (v->is_reservation()) {
+        reservation_list.insert(*v);
+    } else {
+        vma_list.insert(*v);
+    }
+    return free.start();
 }
 
 inline bool in_vma_range(void* addr)
@@ -1264,7 +1329,7 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
     return total;
 }
 
-void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
+void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm, bool use_reserved)
 {
     bool search = !(flags & mmap_fixed);
     size = align_up(size, mmu::page_size);
@@ -1272,7 +1337,7 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
     auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
     PREVENT_STACK_PAGE_FAULT
     SCOPE_LOCK(vma_list_mutex.for_write());
-    auto v = (void*) allocate(vma, start, size, search);
+    auto v = (void*) allocate(vma, start, size, search, use_reserved);
     if (flags & mmap_populate) {
         populate_vma(vma, v, size);
     }
@@ -1290,7 +1355,7 @@ std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned f
 }
 
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
-              fileref f, f_offset offset)
+              fileref f, f_offset offset, bool use_reserved)
 {
     bool search = !(flags & mmu::mmap_fixed);
     size = align_up(size, mmu::page_size);
@@ -1299,7 +1364,7 @@ void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
     void *v;
     PREVENT_STACK_PAGE_FAULT
     WITH_LOCK(vma_list_mutex.for_write()) {
-        v = (void*) allocate(vma, start, size, search);
+        v = (void*) allocate(vma, start, size, search, use_reserved);
         if (flags & mmap_populate) {
             populate_vma(vma, v, std::min(size, align_up(::size(f), page_size)));
         }
@@ -1428,6 +1493,24 @@ void vma::set(uintptr_t start, uintptr_t end)
     _range = addr_range(align_down(start, mmu::page_size), align_up(end, mmu::page_size));
 }
 
+void vma::set_ranges(std::vector<addr_range> ranges)
+{
+    _ranges = ranges;
+}
+
+void vma::free_range()
+{
+    if (_on_reserved) {
+        if (_ranges.size() <= 1) {
+            add_free(_range);
+        } else {
+            for (auto &r : _ranges) {
+                add_free(r);
+            }
+        }
+    }
+}
+
 void vma::protect(unsigned perm)
 {
     _perm = perm;
@@ -1515,6 +1598,30 @@ page_allocator* vma::page_ops()
     return _page_ops;
 }
 
+reserved_vma::reserved_vma(addr_range range, unsigned perm, unsigned flags)
+    : vma(range, perm, flags, false)
+{
+    _is_reserved = true;
+}
+
+error reserved_vma::sync(uintptr_t start, uintptr_t end)
+{
+    return no_error();
+}
+
+addr_range reserve_memory_region(const void * _start, const void* _end)
+{
+    auto start = reinterpret_cast<uintptr_t>(_start);
+    auto end = reinterpret_cast<uintptr_t>(_end);
+    auto size = align_up(end-start, mmu::page_size);
+    //debug_early(("attempt to reserve: start:" + std::to_string(start) + " end: " + std::to_string(end) + " \n").c_str());
+    auto* vma = new mmu::reserved_vma(addr_range(start, end), 0, 0);
+    PREVENT_STACK_PAGE_FAULT
+    SCOPE_LOCK(vma_list_mutex.for_write());
+    start = allocate(vma,start,size,true, false);
+    return vma->range(); //todo check
+}
+
 static uninitialized_anonymous_page_provider page_allocator_noinit;
 static initialized_anonymous_page_provider page_allocator_init;
 static page_allocator *page_allocator_noinitp = &page_allocator_noinit, *page_allocator_initp = &page_allocator_init;
@@ -1524,15 +1631,19 @@ anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
 {
 }
 
-void anon_vma::split(uintptr_t edge)
+/*void anon_vma::split(uintptr_t edge)
 {
     if (edge <= _range.start() || edge >= _range.end()) {
         return;
     }
+    std::vector<addr_range> ranges;
     vma* n = new anon_vma(addr_range(edge, _range.end()), _perm, _flags);
+    n->set_ranges
     set(_range.start(), edge);
+    ranges.emplace_back(_range.start(), edge);
+    set_ranges(ranges);
     vma_list.insert(*n);
-}
+}*/
 
 error anon_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -1606,10 +1717,10 @@ bool jvm_balloon_vma::add_partial(size_t partial, unsigned char *eff)
     return _partial_copy == real_size();
 }
 
-void jvm_balloon_vma::split(uintptr_t edge)
+/*void jvm_balloon_vma::split(uintptr_t edge)
 {
     abort();
-}
+}*/
 
 error jvm_balloon_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -1639,7 +1750,7 @@ jvm_balloon_vma::~jvm_balloon_vma()
     // for a dangling mapping representing a balloon that was already moved
     // out.
     vma_list.erase(*this);
-    add_free(range());
+    free_range();
     assert(!(_real_flags & mmap_jvm_balloon));
     mmu::map_anon(addr(), size(), _real_flags, _real_perm);
 
@@ -1708,7 +1819,7 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
                     // Since we will change its position in the tree, for the sake of future
                     // lookups we need to reinsert it.
                     vma_list.erase(*jvma);
-                    auto old_range = jvma->range();
+                    jvma->free_range();
                     if (jvma->start() < start) {
                         assert(jvma->partial() >= (jvma->end() - start));
                         jvma->set(jvma->start(), start);
@@ -1716,20 +1827,15 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
                         assert(jvma->partial() >= (end - jvma->start()));
                         jvma->set(end, jvma->end());
                     }
-                    auto new_range = jvma->range();
-                    if (old_range.start() < new_range.start()) {
-                        add_free(addr_range(old_range.start(), new_range.start()));
-                    }
-                    if (new_range.end() < old_range.end()) {
-                        add_free(addr_range(new_range.end(), old_range.end()));
-                    }
+                    auto ranges = aquire_fixed(jvma->range().start(), jvma->range().end());
+                    jvma->set_ranges(ranges);
                     vma_list.insert(*jvma);
                 } else {
                     // Note how v and jvma are different. This is because this one,
                     // we will delete.
                     auto& v = *i--;
                     vma_list.erase(v);
-                    add_free(v.range());
+                    v.free_range();
                     // Finish the move. In practice, it will temporarily remap an
                     // anon mapping here, but this should be rare. Let's not
                     // complicate the code to optimize it. There are no
@@ -1795,7 +1901,7 @@ file_vma::~file_vma()
     delete _page_ops;
 }
 
-void file_vma::split(uintptr_t edge)
+/*void file_vma::split(uintptr_t edge)
 {
     if (edge <= _range.start() || edge >= _range.end()) {
         return;
@@ -1804,7 +1910,7 @@ void file_vma::split(uintptr_t edge)
     vma *n = _file->mmap(addr_range(edge, _range.end()), _flags, _perm, off).release();
     set(_range.start(), edge);
     vma_list.insert(*n);
-}
+}*/
 
 error file_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -2048,6 +2154,12 @@ std::string procfs_maps()
         }
     }
     return os.str();
+}
+
+void print_vmas() {
+    for (auto i = vma_list.begin(); i != vma_list.end(); i++) {
+        debug_early(("vma start: " + std::to_string(i->start()) + " end: " + std::to_string(i->end()) + " \n").c_str());
+    }
 }
 
 }

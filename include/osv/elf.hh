@@ -439,6 +439,7 @@ protected:
     bool is_core();
     bool _init_called;
     void* _eh_frame;
+    bool _use_reservation = false;
 
     std::unordered_map<std::string,void*> _cached_symbols;
 

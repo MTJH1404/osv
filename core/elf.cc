@@ -354,6 +354,7 @@ void object::set_base(void* base)
     std::vector<const Elf64_Phdr*> pt_load_headers;
     for (auto& p : _phdrs) {
         if (p.p_type == PT_LOAD) {
+            //debug_early(("set_base p " + std::to_string(reinterpret_cast<uintptr_t>(p.p_vaddr)) + " p_filesz " + std::to_string(reinterpret_cast<uintptr_t>(p.p_filesz)) + " p_memsz " + std::to_string(reinterpret_cast<uintptr_t>(p.p_memsz)) + " \n").c_str());
             pt_load_headers.push_back(&p);
         }
     }
@@ -364,6 +365,12 @@ void object::set_base(void* base)
     auto q = *std::max_element(pt_load_headers.begin(), pt_load_headers.end(),
                               [](const Elf64_Phdr* a, const Elf64_Phdr* b)
                                   { return a->p_vaddr < b->p_vaddr; });
+
+    /*if (is_non_pie_executable()) {
+        debug_early("loading non pie\n");
+    } else {
+        debug_early("loading pie\n");
+    }*/
 
     if (!is_core() && is_non_pie_executable()) {
         // Verify non-PIE executable does not collide with the kernel
@@ -378,12 +385,20 @@ void object::set_base(void* base)
         // Otherwise for kernel, PIEs and shared libraries set the base as requested by caller
         _base = align(base, p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
     }
-
-    _end = _base + q->p_vaddr + q->p_memsz;
-    if (!is_non_pie_executable()) {
-        auto reservation = mmu::reserve_memory_region(_base, _end);
+    ulong vstart = align_down(q->p_vaddr, mmu::page_size);
+    ulong filesz_unaligned = q->p_vaddr + q->p_filesz - vstart;
+    ulong filesz = align_up(filesz_unaligned, mmu::page_size);
+    ulong memsz = align_up(q->p_vaddr + q->p_memsz, mmu::page_size) - vstart;
+    _end = _base + vstart + (filesz<memsz ? memsz : filesz);
+    //debug_early(("set_base _base " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " \n").c_str());
+    //debug_early(("set_base _end " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());
+    if (!is_non_pie_executable()) { //|| is_core()
+        auto reservation = mmu::reserve_memory_region(_base, _end, true);
         _base = align(reinterpret_cast<void*>(reservation.start()), p->p_align, p->p_vaddr & (p->p_align - 1)) - p->p_vaddr;
+        _end = _base + vstart + (filesz<memsz ? memsz : filesz); //q->p_vaddr + q->p_memsz;
         _use_reservation = true;
+        //debug_early(("set_base reservation _base " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " \n").c_str());
+        //debug_early(("set_base reservation _end " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());
     }
 
     elf_debug("The base set to: %018p and end: %018p\n", _base, _end);
@@ -419,12 +434,24 @@ void file::load_segment(const Elf64_Phdr& phdr)
     unsigned perm = get_segment_mmap_permissions(phdr);
 
     auto flag = mmu::mmap_fixed | (mlocked() ? mmu::mmap_populate : 0);
-    mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size));
+    /*debug_early(("load_segment phdr.p_vaddr " + std::to_string(reinterpret_cast<uintptr_t>(phdr.p_vaddr)) + " \n").c_str());
+    debug_early(("load_segment vstart " + std::to_string(reinterpret_cast<uintptr_t>(vstart)) + " \n").c_str());
+    debug_early(("load_segment filesz_unaligned " + std::to_string(reinterpret_cast<uintptr_t>(filesz_unaligned)) + " \n").c_str());
+    debug_early(("load_segment filesz " + std::to_string(reinterpret_cast<uintptr_t>(filesz)) + " \n").c_str());
+    debug_early(("load_segment memsz " + std::to_string(reinterpret_cast<uintptr_t>(memsz)) + " \n").c_str());
+    debug_early(("load_segment _base " + std::to_string(reinterpret_cast<uintptr_t>(_base)) + " \n").c_str());
+    debug_early(("load_segment _base + vstart " + std::to_string(reinterpret_cast<uintptr_t>(_base + vstart)) + " \n").c_str());
+    debug_early(("load_segment _base + vstart + filesz " + std::to_string(reinterpret_cast<uintptr_t>(_base + vstart + filesz)) + " \n").c_str());
+    debug_early(("load_segment _base + vstart + memsz " + std::to_string(reinterpret_cast<uintptr_t>(_base + vstart + filesz)) + " \n").c_str());
+    debug_early(("load_segment _end " + std::to_string(reinterpret_cast<uintptr_t>(_end)) + " \n").c_str());*/
+    assert(_base + vstart + filesz <= _end);
+    mmu::map_file(_base + vstart, filesz, flag, perm, _f, align_down(phdr.p_offset, mmu::page_size), _use_reservation);
     if (phdr.p_filesz != phdr.p_memsz) {
         assert(perm & mmu::perm_write);
         memset(_base + vstart + filesz_unaligned, 0, filesz - filesz_unaligned);
         if (memsz != filesz) {
-            mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm);
+            assert(_base + vstart + memsz <= _end);
+            mmu::map_anon(_base + vstart + filesz, memsz - filesz, flag, perm, _use_reservation);
         }
     }
     elf_debug("Loaded and mapped PT_LOAD segment at: %018p of size: 0x%x\n", _base + vstart, filesz);
@@ -1430,6 +1457,7 @@ program::load_object(std::string name, std::vector<std::string> extra_path,
         }
     }
     if (f) {
+        //debug_early((name + "\n").c_str());
         trace_elf_load(name.c_str());
         auto ef = std::shared_ptr<object>(new file(*this, f, name),
                 [=](object *obj) { remove_object(obj); });
@@ -1491,7 +1519,6 @@ program::get_library(std::string name, std::vector<std::string> extra_path, bool
     if (!delay_init) {
         init_library();
     }
-
     return ret;
 }
 

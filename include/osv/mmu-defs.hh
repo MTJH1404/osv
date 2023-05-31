@@ -36,6 +36,12 @@ enum class mem_area {
     debug,
 };
 
+enum alloc_types {
+    search,
+    fixed,
+    on_reservation
+};
+
 constexpr mem_area identity_mapped_areas[] = {
     mem_area::main,
     mem_area::page,

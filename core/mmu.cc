@@ -65,6 +65,10 @@ struct vma_range_compare {
     }
 };
 
+/*__attribute__((init_priority((int)init_prio::vma_range_set)))
+std::set<vma_range, vma_range_compare> vma_range_set;
+rwlock_t vma_range_set_mutex;*/
+
 struct linear_vma_compare {
     bool operator()(const linear_vma* a, const linear_vma* b) {
         return a->_virt_addr < b->_virt_addr;
@@ -92,14 +96,28 @@ typedef boost::intrusive::set<vma,
                               bi::optimize_size<true>
                               > vma_list_base;
 
+//static bool buddy_initialized = false;
+
 struct vma_list_type : vma_list_base {
+    //size_T buddy_ref;
+    //int count;
     vma_list_type() {
         // insert markers for the edges of allocatable area
         // simplifies searches
-        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
+        /*auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
         insert(*lower_edge);
         auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
-        insert(*upper_edge);
+        insert(*upper_edge);*/
+        //nballoc_fixed(lower_vma_limit, fixed_alloc_border); //auto res = 
+        /*WITH_LOCK(vma_range_set_mutex.for_write()) {
+            vma_range_set.insert(vma_range(lower_edge));
+            vma_range_set.insert(vma_range(upper_edge));
+        }*/
+        //buddy_ref = res
+        /*if (!buddy_initialized) {
+            init_buddy_tree();
+            buddy_initialized = true;
+        }*/
     }
 };
 
@@ -929,9 +947,13 @@ find_intersecting_vma(uintptr_t addr) {
     if (vma->start() == addr) {
         return vma;
     }
+    //debug_early(("find_intersecting_vma start " + std::to_string(reinterpret_cast<uintptr_t>(vma->start())) + " \n").c_str());
+    //debug_early(("find_intersecting_vma end " + std::to_string(reinterpret_cast<uintptr_t>(vma->end())) + " \n").c_str());
     // Otherwise, vma->start() > addr, so we need to check the previous vma
     --vma;
-    if (addr >= vma->start() && addr < vma->end()) {
+    //debug_early(("find_intersecting_vma --vma start " + std::to_string(reinterpret_cast<uintptr_t>(vma->start())) + " \n").c_str());
+    //debug_early(("find_intersecting_vma --vma end " + std::to_string(reinterpret_cast<uintptr_t>(vma->end())) + " \n").c_str());
+    if (addr >= vma->start() && addr <= vma->end()) {
         return vma;
     } else {
         return vma_list.end();
@@ -1009,6 +1031,7 @@ static error protect(const void *addr, size_t size, unsigned int perm)
     uintptr_t start = reinterpret_cast<uintptr_t>(addr);
     uintptr_t end = start + size;
     auto range = find_intersecting_vmas(addr_range(start, end));
+    //debug_early("protect\n");
     for (auto i = range.first; i != range.second; ++i) {
         if (i->perm() == perm)
             continue;
@@ -1016,8 +1039,8 @@ static error protect(const void *addr, size_t size, unsigned int perm)
         if (err != 0) {
             return make_error(err);
         }
-        //i->split(end);
-        //i->split(start);
+        i->split(end);
+        i->split(start);
         if (contains(start, end, *i)) {
             i->protect(perm);
             i->operate_range(protection(perm));
@@ -1032,49 +1055,118 @@ public:
     bool operator()(uintptr_t x, const vma_range& y) const { return x < y.start(); }
 };
 
+/*uintptr_t find_hole(uintptr_t start, uintptr_t size)
+{
+    bool small = size < huge_page_size;
+    uintptr_t good_enough = 0;
+
+    SCOPE_LOCK(vma_range_set_mutex.for_read());
+    //Find first vma range which starts before the start parameter or is the 1st one
+    auto p = std::lower_bound(vma_range_set.begin(), vma_range_set.end(), start, vma_range_addr_compare());
+    if (p != vma_range_set.begin()) {
+        --p;
+    }
+    auto n = std::next(p);
+    while (n->start() <= upper_vma_limit) { //we only go up to the upper mmap vma limit
+        //See if desired hole fits between p and n vmas
+        if (start >= p->end() && start + size <= n->start()) {
+            return start;
+        }
+        //See if shifting start to the end of p makes desired hole fit between p and n
+        if (p->end() >= start && n->start() - p->end() >= size) {
+            good_enough = p->end();
+            if (small) {
+                return good_enough;
+            }
+            //See if huge hole fits between p and n
+            if (n->start() - align_up(good_enough, huge_page_size) >= size) {
+                return align_up(good_enough, huge_page_size);
+            }
+        }
+        //If nothing worked move next in the list
+        p = n;
+        ++n;
+    }
+    if (good_enough) {
+        return good_enough;
+    }
+    throw make_error(ENOMEM);
+}*/
+
 ulong evacuate(uintptr_t start, uintptr_t end)
 {
-    auto range = find_intersecting_vmas(addr_range(start, end));
-    auto reserved_range = find_intersecting_vmas_reserved(addr_range(start, end));
     ulong ret = 0;
-    //debug_early(("evac start: " + std::to_string(start) + " end: " + std::to_string(end) + " \n").c_str());
-    for (auto i = reserved_range.first; i != reserved_range.second; ++i) {
-        //i->split(end);
-        //i->split(start);
-        //if (contains(start, end, *i) || ) {
-            
-        //}
+    auto range = find_intersecting_vmas_reserved(addr_range(start, end));
+    for (auto i = range.first; i != range.second; ++i) {
         auto& dead = *i--;
-        auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-        //ret += size;
-        if (dead.has_flags(mmap_jvm_heap)) {
-            memory::stats::on_jvm_heap_free(size);
-        }
+        ret += dead.end()-dead.start();
         reservation_list.erase(dead);
-        //debug_early(("evac reserved dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+        //debug_early(("evac reserved dead start: " + std::to_string(rng.start()) + " end: " + std::to_string(rng.end()) + " \n").c_str());
         dead.free_range();
         delete &dead;
     }
-    //print_vmas();
+    //debug_early(("evac try start: " + std::to_string(start) + " end: " + std::to_string(end) + " \n").c_str());
+    range = find_intersecting_vmas(addr_range(start, end));
     for (auto i = range.first; i != range.second; ++i) {
-        //i->split(end);
-        //i->split(start);
-        //if (contains(start, end, *i) || ) {
-            
-        //}
-        auto& dead = *i--;
-        auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-        ret += size;
-        if (dead.has_flags(mmap_jvm_heap)) {
-            memory::stats::on_jvm_heap_free(size);
-        }
-        vma_list.erase(dead);
-        //debug_early(("evac dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
-        dead.free_range();
-        delete &dead;
+        //if (i->splittable()) {
+            i->split(end);
+            i->split(start);
+            if ((start <= i->start()) && (end >= i->end())) { //contains(start, end, *i)
+                auto& dead = *i--;
+                //debug_early(("evac dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+                auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+                ret += size;
+                if (dead.has_flags(mmap_jvm_heap)) {
+                    memory::stats::on_jvm_heap_free(size);
+                }
+                vma_list.erase(dead);
+                dead.free_range();
+                delete &dead;
+            }
+        //} 
+        /*else {
+            if ((start <= i->start()) && (end >= i->end())) {
+                auto& dead = *i--;
+                debug_early(("evac dead start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+                auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+                if (!dead.has_used_reservation()) {
+                    ret += size;
+                }
+                if (dead.has_flags(mmap_jvm_heap)) {
+                    memory::stats::on_jvm_heap_free(size);
+                }
+                vma_list.erase(dead);
+                dead.free_range();
+                delete &dead;
+            } else {
+                auto& dead = *i;
+                debug_early(("evac not intersecting start: " + std::to_string(dead.start()) + " end: " + std::to_string(dead.end()) + " \n").c_str());
+            }
+        }*/
     }
     return ret;
-    // FIXME: range also indicates where we can insert a new anon_vma, use it
+}
+
+ulong evacuate_on_reserved(uintptr_t start, uintptr_t end)
+{
+    ulong ret = 0;
+    auto range = find_intersecting_vmas(addr_range(start, end));
+    //debug_early("evacuate_on_reserved\n");
+    for (auto i = range.first; i != range.second; ++i) {
+        i->split(end);
+        i->split(start);
+        if (contains(start, end, *i)) {
+            auto& dead = *i--;
+            auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
+            ret += size;
+            if (dead.has_flags(mmap_jvm_heap)) {
+                memory::stats::on_jvm_heap_free(size);
+            }
+            vma_list.erase(dead);
+            delete &dead;
+        }
+    }
+    return ret;
 }
 
 static void unmap(const void* addr, size_t size)
@@ -1196,42 +1288,64 @@ public:
     }
 };
 
-uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search, bool use_reserved)
+uintptr_t allocate(vma *v, uintptr_t start, size_t size, alloc_types type)
 {
-    std::vector<addr_range> ranges;
-    //debug_early(("allocate : " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
-    //debug_early("allocate \n");
-    if (use_reserved) { // TODO add check if area is reserved
-        //debug_early("allocate reserved\n");
-        // the given range was already reserved, memory distribution needs to handled by reserving party
-        v->set(start, start+size);
-        //debug_early(("allocate reserved start: " + std::to_string(v->start()) + " end: " + std::to_string(v->end()) + " \n").c_str());
-        v->set_on_reserved(true);
-        vma_list.insert(*v);
-        return v->start();
+    int count = 0;
+    size_t buddy_ref = 0;
+    std::pair<uintptr_t, std::size_t> search_res;
+    std::pair<int, std::size_t> fixed_res;
+    /*debug_early(("allocate try start: " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
+    if (start <= 0x200000108640 && 0x200000108640 <= start+size) {
+        debug_early(("allocate found it here: " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
+    }*/
+    switch (type) {
+        case on_reservation:
+            //debug_early("allocate reserved\n");
+            evacuate_on_reserved(start, size);
+            v->set_on_reserved(true);
+            count = 0;
+            buddy_ref = 0;
+            break;
+        case fixed:
+            //debug_early("allocate fixed\n");
+            evacuate(start, start+size);
+            fixed_res = nballoc_fixed(start, size);
+            count = fixed_res.first;
+            buddy_ref = fixed_res.second;
+            break;
+        case search:
+        default:
+            //debug_early("allocate search\n");
+            if (start) {
+                //debug_early("allocate search with hint\n");
+                search_res = nballoc(size, start);
+            } else {
+                auto max = vma_list.rbegin();
+                if (max->start()>0x300000000000) {
+                    search_res = nballoc(size, 0x300000000000);
+                } else {
+                    //debug_early("allocate search without hint\n");
+                    search_res = nballoc(size);
+                }
+            }
+            start = search_res.first;
+            count = 1;
+            buddy_ref = search_res.second;
+            size = mmu::size_n(buddy_ref);
+            break;
     }
-    if (!search) {
-        // aquires memory range as requested use only if necessary, consider reserving area instead
-        //debug_early("allocate fixed\n");
-        evacuate(start, start+size);
-        auto res = aquire_fixed(start, start + size);
-        //debug_early(("allocate fixed start: " + std::to_string(res.start()) + " end: " + std::to_string(res.end()) + " \n").c_str());
-        v->set(start, start+size);
-        v->set_ranges(res);
-        vma_list.insert(*v);
-        return start;
-    }
-    //debug_early("allocate search\n");
-    auto free = find_free(size);
-    start = free.start();
-    //debug_early(("allocate search start: " + std::to_string(free.start()) + " end: " + std::to_string(free.end()) + " \n").c_str());
-    v->set(free.start(), free.end());
+    v->set(start, start+size);
+    v->set_buddy_ref(buddy_ref,count);
+    //debug_early(("allocated start: " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
+    /*if (start <= 35184373174272 && 35184373174272 <= start+size) {
+        debug_early(("allocate found it here: " + std::to_string(start) + " end: " + std::to_string(start + size) + " \n").c_str());
+    }*/
     if (v->is_reservation()) {
         reservation_list.insert(*v);
     } else {
         vma_list.insert(*v);
     }
-    return free.start();
+    return start;
 }
 
 inline bool in_vma_range(void* addr)
@@ -1331,16 +1445,26 @@ ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
 
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm, bool use_reserved)
 {
+    //debug_early("map anon vma\n");
     bool search = !(flags & mmap_fixed);
+    alloc_types type;
+    if (search) {
+        type = alloc_types::search;
+    } else if (use_reserved) {
+        type = alloc_types::on_reservation;
+    } else {
+        type = alloc_types::fixed;
+    }
     size = align_up(size, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
     PREVENT_STACK_PAGE_FAULT
     SCOPE_LOCK(vma_list_mutex.for_write());
-    auto v = (void*) allocate(vma, start, size, search, use_reserved);
+    auto v = (void*) allocate(vma, start, size, type);
     if (flags & mmap_populate) {
         populate_vma(vma, v, size);
     }
+    //debug_early(("map_anon vma perm " + std::to_string(vma->perm()) + " \n").c_str());
     return v;
 }
 
@@ -1357,14 +1481,23 @@ std::unique_ptr<file_vma> map_file_mmap(file* file, addr_range range, unsigned f
 void* map_file(const void* addr, size_t size, unsigned flags, unsigned perm,
               fileref f, f_offset offset, bool use_reserved)
 {
+    //debug_early("map file vma\n");
     bool search = !(flags & mmu::mmap_fixed);
+    alloc_types type;
+    if (search) {
+        type = alloc_types::search;
+    } else if (use_reserved) {
+        type = alloc_types::on_reservation;
+    } else {
+        type = alloc_types::fixed;
+    }
     size = align_up(size, mmu::page_size);
     auto start = reinterpret_cast<uintptr_t>(addr);
     auto *vma = f->mmap(addr_range(start, start + size), flags | mmap_file, perm, offset).release();
     void *v;
     PREVENT_STACK_PAGE_FAULT
     WITH_LOCK(vma_list_mutex.for_write()) {
-        v = (void*) allocate(vma, start, size, search, use_reserved);
+        v = (void*) allocate(vma, start, size, type);
         if (flags & mmap_populate) {
             populate_vma(vma, v, std::min(size, align_up(::size(f), page_size)));
         }
@@ -1466,6 +1599,14 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     WITH_LOCK(vma_list_mutex.for_read()) {
         auto vma = find_intersecting_vma(addr);
         if (vma == vma_list.end() || access_fault(*vma, ef->get_error())) {
+            /*debug_early(("vm_fault addr " + std::to_string(addr) + " \n").c_str());
+            if (vma == vma_list.end()) {
+                debug_early("vm_fault vma == vma_list.end() \n");
+            } else { // (access_fault(*vma, ef->get_error()))
+                debug_early("vm_fault access_fault \n");
+            }
+            debug_early(("vm_fault perm " + std::to_string(vma->perm()) + " \n").c_str());
+            print_vmas();*/
             vm_sigsegv(addr, ef);
             trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "slow");
             return;
@@ -1493,26 +1634,27 @@ void vma::set(uintptr_t start, uintptr_t end)
     _range = addr_range(align_down(start, mmu::page_size), align_up(end, mmu::page_size));
 }
 
-void vma::set_ranges(std::vector<addr_range> ranges)
+void vma::set_buddy_ref(size_t ref, int count)
 {
-    _ranges = ranges;
+    _buddy = ref;
+    _buddy_count = count;
 }
 
 void vma::free_range()
 {
-    if (_on_reserved) {
-        if (_ranges.size() <= 1) {
-            add_free(_range);
-        } else {
-            for (auto &r : _ranges) {
-                add_free(r);
-            }
-        }
+    /*debug_early("free_range\n");
+    debug_early(("free_range _buddy: " + std::to_string(_buddy) + " \n").c_str());
+    debug_early(("free_range _buddy_count: " + std::to_string(_buddy_count) + " \n").c_str());
+    //debug_early(("free_range start: " + std::to_string(start()) + " end: " + std::to_string(end()) + " \n").c_str());*/
+    for (int i=0; i<_buddy_count; i++) {
+        nbfree(_buddy+i);
     }
 }
 
 void vma::protect(unsigned perm)
 {
+    //debug_early(("protect start: " + std::to_string(start()) + " end: " + std::to_string(end()) + " \n").c_str());
+    //debug_early(("protect perm " + std::to_string(perm) + " \n").c_str());
     _perm = perm;
 }
 
@@ -1609,16 +1751,23 @@ error reserved_vma::sync(uintptr_t start, uintptr_t end)
     return no_error();
 }
 
-addr_range reserve_memory_region(const void * _start, const void* _end)
+addr_range reserve_memory_region(void * _start, void * _end, bool search)
 {
     auto start = reinterpret_cast<uintptr_t>(_start);
     auto end = reinterpret_cast<uintptr_t>(_end);
-    auto size = align_up(end-start, mmu::page_size);
+    size_t size = end-start;
+    alloc_types type;
+    if (search) {
+        type = alloc_types::search;
+    } else {
+        type = alloc_types::fixed;
+    }
+    //debug_early("reserve vma\n");
     //debug_early(("attempt to reserve: start:" + std::to_string(start) + " end: " + std::to_string(end) + " \n").c_str());
     auto* vma = new mmu::reserved_vma(addr_range(start, end), 0, 0);
     PREVENT_STACK_PAGE_FAULT
     SCOPE_LOCK(vma_list_mutex.for_write());
-    start = allocate(vma,start,size,true, false);
+    start = allocate(vma, start, size, type);
     return vma->range(); //todo check
 }
 
@@ -1631,19 +1780,41 @@ anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
 {
 }
 
-/*void anon_vma::split(uintptr_t edge)
+void anon_vma::split(uintptr_t edge)
 {
     if (edge <= _range.start() || edge >= _range.end()) {
-        return;
+            return;
     }
-    std::vector<addr_range> ranges;
-    vma* n = new anon_vma(addr_range(edge, _range.end()), _perm, _flags);
-    n->set_ranges
-    set(_range.start(), edge);
-    ranges.emplace_back(_range.start(), edge);
-    set_ranges(ranges);
-    vma_list.insert(*n);
-}*/
+    if (_buddy_count == 0) {
+        vma* n = new anon_vma(addr_range(edge, _range.end()), _perm, _flags);
+        //debug_early(("anon split right start: " + std::to_string(n->start()) + " end: " + std::to_string(n->end()) + " \n").c_str());
+        this->set(_range.start(), edge);
+        //debug_early(("anon split left start: " + std::to_string(start()) + " end: " + std::to_string(end()) + " \n").c_str());
+        n->set_buddy_ref(0,0);
+        vma_list.insert(*n);
+    } else {
+        split_result res;
+        if (_buddy_count == 1) {
+            res = nbsplit(_buddy, edge);
+        } else {
+            res = nbsplit(_buddy, _buddy_count, edge);
+        }
+        if (res.splitted) {
+            /*debug_early(("anon split right_ref: " + std::to_string(res.right_ref) + " \n").c_str());
+            debug_early(("anon split starting_n(res.right_ref): " + std::to_string(starting_n(res.right_ref)) + " \n").c_str());
+            debug_early(("anon split res.right_count): " + std::to_string(res.right_count) + " \n").c_str());
+            debug_early(("anon split res.left_count): " + std::to_string(res.left_count) + " \n").c_str());
+            debug_early(("anon split res.left_ref): " + std::to_string(res.left_ref) + " \n").c_str());*/
+            vma* n = new anon_vma(addr_range(starting_n(res.right_ref), _range.end()), _perm, _flags);
+            n->set_buddy_ref(res.right_ref,res.right_count);
+            vma_list.insert(*n);
+            //debug_early(("anon split right start: " + std::to_string(n->start()) + " end: " + std::to_string(n->end()) + " \n").c_str());
+            this->set(_range.start(), starting_n(res.right_ref));
+            //debug_early(("anon split left start: " + std::to_string(start()) + " end: " + std::to_string(end()) + " \n").c_str());
+            this->set_buddy_ref(res.left_ref,res.left_count);
+        }
+    }
+}
 
 error anon_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -1717,10 +1888,10 @@ bool jvm_balloon_vma::add_partial(size_t partial, unsigned char *eff)
     return _partial_copy == real_size();
 }
 
-/*void jvm_balloon_vma::split(uintptr_t edge)
+void jvm_balloon_vma::split(uintptr_t edge)
 {
     abort();
-}*/
+}
 
 error jvm_balloon_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -1827,8 +1998,8 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
                         assert(jvma->partial() >= (end - jvma->start()));
                         jvma->set(end, jvma->end());
                     }
-                    auto ranges = aquire_fixed(jvma->range().start(), jvma->range().end());
-                    jvma->set_ranges(ranges);
+                    auto res = nballoc_fixed(jvma->range().start(), jvma->range().end()-jvma->range().start());
+                    jvma->set_buddy_ref(res.second, res.first);
                     vma_list.insert(*jvma);
                 } else {
                     // Note how v and jvma are different. This is because this one,
@@ -1847,7 +2018,8 @@ ulong map_jvm(unsigned char* jvm_addr, size_t size, size_t align, balloon_ptr b)
         }
 
         evacuate(start, start + size);
-        aquire_fixed(start, start + size);
+        auto res = nballoc_fixed(start, start + size);
+        vma->set_buddy_ref(res.second, res.first);
         vma_list.insert(*vma);
         return vma->size();
     }
@@ -1901,16 +2073,34 @@ file_vma::~file_vma()
     delete _page_ops;
 }
 
-/*void file_vma::split(uintptr_t edge)
+void file_vma::split(uintptr_t edge)
 {
-    if (edge <= _range.start() || edge >= _range.end()) {
-        return;
+    if (_buddy_count == 0) {
+        if (edge <= _range.start() || edge >= _range.end()) {
+            return;
+        }
+        auto off = offset(edge);
+        vma *n = _file->mmap(addr_range(edge, _range.end()), _flags, _perm, off).release();
+        n->set_buddy_ref(0,0);
+        this->set(_range.start(), edge);
+        vma_list.insert(*n);
+    } else {
+        split_result res;
+        if (_buddy_count == 1) {
+            res = nbsplit(_buddy, edge);
+        } else {
+            res = nbsplit(_buddy, _buddy_count, edge);
+        }
+        if (res.splitted) {
+            auto off = offset(starting_n(res.right_ref));
+            vma* n = _file->mmap(addr_range(starting_n(res.right_ref), _range.end()), _flags, _perm, off).release();
+            n->set_buddy_ref(res.right_ref,res.right_count);
+            vma_list.insert(*n);
+            this->set(_range.start(), starting_n(res.right_ref));
+            this->set_buddy_ref(res.left_ref,res.left_count);
+        }
     }
-    auto off = offset(edge);
-    vma *n = _file->mmap(addr_range(edge, _range.end()), _flags, _perm, off).release();
-    set(_range.start(), edge);
-    vma_list.insert(*n);
-}*/
+}
 
 error file_vma::sync(uintptr_t start, uintptr_t end)
 {
@@ -2158,7 +2348,7 @@ std::string procfs_maps()
 
 void print_vmas() {
     for (auto i = vma_list.begin(); i != vma_list.end(); i++) {
-        debug_early(("vma start: " + std::to_string(i->start()) + " end: " + std::to_string(i->end()) + " \n").c_str());
+        debug_early(("vma start: " + std::to_string(i->start()) + " end: " + std::to_string(i->end()) + " perm " + std::to_string(i->perm()) + " \n").c_str());
     }
 }
 
